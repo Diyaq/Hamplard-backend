@@ -17,6 +17,8 @@ import { ReferralsModule } from '../referrals/referrals.module';
 import { RefreshTokenService } from './refresh-token.service';
 import { SessionsController } from './sessions.controller';
 import { SessionsService } from './sessions.service';
+import { TwoFactorController } from './two-factor.controller';
+import { TwoFactorService } from './two-factor.service';
 
 import { ThrottlerModule } from '@nestjs/throttler';
 
@@ -34,7 +36,13 @@ import { ThrottlerModule } from '@nestjs/throttler';
     }),
     ReferralsModule,
   ],
-  controllers: [AuthController, GoogleAuthController, OtpController, SessionsController],
+  controllers: [
+    AuthController,
+    GoogleAuthController,
+    OtpController,
+    SessionsController,
+    TwoFactorController,
+  ],
   providers: [
     AuthService,
     CaptchaService,
@@ -44,6 +52,8 @@ import { ThrottlerModule } from '@nestjs/throttler';
     GoogleAuthGuard,
     OtpService,
     SessionsService,
+    RefreshTokenService,
+    TwoFactorService,
   ],
   exports: [AuthService, OtpService, SessionsService],
 })

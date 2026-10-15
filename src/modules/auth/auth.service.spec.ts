@@ -34,6 +34,10 @@ describe('AuthService', () => {
     }),
   };
 
+  const twoFactor = {
+    verifyLoginCode: jest.fn(),
+  };
+
   const buildService = () =>
     new AuthService(
       prisma as any,
@@ -41,6 +45,7 @@ describe('AuthService', () => {
       referrals as any,
       sessions as any,
       refreshTokens as any,
+      twoFactor as any,
     );
 
   beforeEach(() => {
@@ -153,5 +158,61 @@ describe('AuthService', () => {
     ).rejects.toBeInstanceOf(UnauthorizedException);
     expect(refreshTokens.issueTokenPair).not.toHaveBeenCalled();
   });
-});
+  describe('two-factor authentication on login', () => {
+    const signedLoginPayload = (service: AuthService, keypair: Keypair) => {
+      const stellarAddress = keypair.publicKey();
+      const nonce = service.generateNonce(stellarAddress);
+      const signature = keypair.sign(Buffer.from(nonce, 'utf-8')).toString('base64');
+      return { stellarAddress, signedNonce: nonce, signature };
+    };
 
+    const twoFactorUser = (stellarAddress: string) => ({
+      id: 'user-2fa',
+      stellarAddress,
+      googleId: null,
+      role: 'INSTRUCTOR',
+      twoFactorEnabled: true,
+    });
+
+    it('returns 401 when 2FA is enabled and no totpCode is supplied', async () => {
+      const keypair = Keypair.random();
+      const service = buildService();
+      const payload = signedLoginPayload(service, keypair);
+      prisma.user.findUnique.mockResolvedValue(twoFactorUser(payload.stellarAddress));
+
+      await expect(service.login(payload)).rejects.toBeInstanceOf(UnauthorizedException);
+
+      expect(twoFactor.verifyLoginCode).not.toHaveBeenCalled();
+      expect(refreshTokens.issueTokenPair).not.toHaveBeenCalled();
+    });
+
+    it('returns 401 when the supplied totpCode is invalid', async () => {
+      const keypair = Keypair.random();
+      const service = buildService();
+      const payload = signedLoginPayload(service, keypair);
+      prisma.user.findUnique.mockResolvedValue(twoFactorUser(payload.stellarAddress));
+      twoFactor.verifyLoginCode.mockResolvedValue(false);
+
+      await expect(service.login({ ...payload, totpCode: '000000' })).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+
+      expect(refreshTokens.issueTokenPair).not.toHaveBeenCalled();
+    });
+
+    it('issues tokens when the supplied totpCode is valid', async () => {
+      const keypair = Keypair.random();
+      const service = buildService();
+      const payload = signedLoginPayload(service, keypair);
+      const user = twoFactorUser(payload.stellarAddress);
+      prisma.user.findUnique.mockResolvedValue(user);
+      prisma.user.upsert.mockResolvedValue(user);
+      twoFactor.verifyLoginCode.mockResolvedValue(true);
+
+      const result = await service.login({ ...payload, totpCode: '123456' });
+
+      expect(twoFactor.verifyLoginCode).toHaveBeenCalledWith('user-2fa', '123456');
+      expect(result.accessToken).toBe('access-jwt');
+    });
+  });
+});

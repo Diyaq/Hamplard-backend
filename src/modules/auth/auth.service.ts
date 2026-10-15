@@ -8,7 +8,6 @@ import { Keypair, StrKey } from '@stellar/stellar-sdk';
 import { SessionsService, DeviceMetadata } from './sessions.service';
 
 import { TwoFactorService } from './two-factor.service';
-import { Optional, Inject } from '@nestjs/common';
 
 /**
  * How many milliseconds of clock-skew between client and server we tolerate
@@ -42,7 +41,7 @@ export class AuthService {
     private readonly referrals: ReferralsService,
     private readonly sessions: SessionsService,
     private readonly refreshTokens: RefreshTokenService,
-    @Optional() private readonly twoFactor?: TwoFactorService,
+    private readonly twoFactor: TwoFactorService,
   ) {}
 
   // ------------------------------------------------------------------
@@ -186,7 +185,7 @@ export class AuthService {
     const isNewUser = !existing;
 
     // ---- 8b. Validate 2FA code when the account has it enabled ----
-    if (existing?.twoFactorEnabled && this.twoFactor) {
+    if (existing?.twoFactorEnabled) {
       if (!totpCode) {
         throw new UnauthorizedException('Two-factor authentication code required');
       }
