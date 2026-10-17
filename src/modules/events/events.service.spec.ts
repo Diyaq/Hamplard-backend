@@ -3,7 +3,30 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CoursesService } from '../courses/courses.service';
-import { EventsService, EVENT_POLLER_CHECKPOINT_KEY } from './events.service';
+import { ConfigService } from '@nestjs/config';
+import { SchedulerRegistry } from '@nestjs/schedule';
+import {
+  EventsService,
+  EVENT_POLLER_CHECKPOINT_KEY,
+  EVENT_POLLER_INTERVAL_NAME,
+} from './events.service';
+
+/**
+ * SchedulerRegistry stand-in that records registered intervals and clears
+ * them immediately so no real timers outlive a test.
+ */
+const buildMockScheduler = () => {
+  const intervals = new Map<string, NodeJS.Timeout>();
+  return {
+    intervals,
+    doesExist: jest.fn((_type: string, name: string) => intervals.has(name)),
+    addInterval: jest.fn((name: string, id: NodeJS.Timeout) => {
+      clearInterval(id);
+      intervals.set(name, id);
+    }),
+    deleteInterval: jest.fn((name: string) => intervals.delete(name)),
+  };
+};
 
 describe('EventsService — ledger checkpoint (Issue #80)', () => {
   let service: EventsService;
@@ -35,6 +58,8 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
         { provide: StellarService, useValue: mockStellar },
         { provide: NotificationsService, useValue: mockNotifications },
         { provide: CoursesService, useValue: mockCourses },
+        { provide: ConfigService, useValue: { get: jest.fn() } },
+        { provide: SchedulerRegistry, useValue: buildMockScheduler() },
       ],
     }).compile();
 
@@ -182,5 +207,125 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
       expect(status.persistedLedger).toBe(777);
       expect(status.key).toBe(EVENT_POLLER_CHECKPOINT_KEY);
     });
+  });
+});
+
+describe('EventsService — poller scheduling & re-entrancy (Issue #229)', () => {
+  let service: EventsService;
+  let scheduler: ReturnType<typeof buildMockScheduler>;
+  const config = { get: jest.fn() };
+
+  const mockPrisma = {
+    eventPollerCheckpoint: {
+      findUnique: jest.fn().mockResolvedValue(null),
+      upsert: jest.fn().mockResolvedValue({}),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    chainEvent: { create: jest.fn().mockResolvedValue({}) },
+  };
+  const mockStellar = {
+    getLatestLedger: jest.fn().mockResolvedValue(100),
+    fetchContractEvents: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    scheduler = buildMockScheduler();
+    config.get.mockReset();
+    mockStellar.fetchContractEvents.mockReset();
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        EventsService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: StellarService, useValue: mockStellar },
+        { provide: NotificationsService, useValue: { notifyUser: jest.fn() } },
+        { provide: CoursesService, useValue: {} },
+        { provide: ConfigService, useValue: config },
+        { provide: SchedulerRegistry, useValue: scheduler },
+      ],
+    }).compile();
+
+    service = module.get(EventsService);
+  });
+
+  it('registers the poll interval with SchedulerRegistry using EVENT_POLLING_INTERVAL_MS', async () => {
+    config.get.mockImplementation((key: string) =>
+      key === 'EVENT_POLLING_INTERVAL_MS' ? '12000' : undefined,
+    );
+    const setIntervalSpy = jest.spyOn(global, 'setInterval');
+
+    await service.onModuleInit();
+
+    expect(service.getPollingIntervalMs()).toBe(12000);
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 12000);
+    expect(scheduler.addInterval).toHaveBeenCalledWith(
+      EVENT_POLLER_INTERVAL_NAME,
+      expect.anything(),
+    );
+    setIntervalSpy.mockRestore();
+  });
+
+  it('defaults to 5000 ms when EVENT_POLLING_INTERVAL_MS is unset or invalid', () => {
+    config.get.mockReturnValue(undefined);
+    expect(service.getPollingIntervalMs()).toBe(5000);
+
+    config.get.mockReturnValue('not-a-number');
+    expect(service.getPollingIntervalMs()).toBe(5000);
+
+    config.get.mockReturnValue('0');
+    expect(service.getPollingIntervalMs()).toBe(5000);
+  });
+
+  it('removes the interval on module destroy', async () => {
+    await service.onModuleInit();
+    service.onModuleDestroy();
+    expect(scheduler.deleteInterval).toHaveBeenCalledWith(EVENT_POLLER_INTERVAL_NAME);
+  });
+
+  it('skips overlapping ticks while a slow poll is still running', async () => {
+    let releaseFetch!: (events: any[]) => void;
+    mockStellar.fetchContractEvents.mockImplementation(
+      () => new Promise((resolve) => { releaseFetch = resolve; }),
+    );
+
+    const slowPoll = service.pollEvents();
+    // Two more ticks fire while the first RPC call is still pending.
+    await service.pollEvents();
+    await service.pollEvents();
+
+    expect(mockStellar.fetchContractEvents).toHaveBeenCalledTimes(1);
+
+    releaseFetch([]);
+    await slowPoll;
+
+    // Once the slow poll finishes the next tick runs normally.
+    mockStellar.fetchContractEvents.mockResolvedValue([]);
+    await service.pollEvents();
+    expect(mockStellar.fetchContractEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the lock even when the RPC fetch fails', async () => {
+    mockStellar.fetchContractEvents
+      .mockRejectedValueOnce(new Error('rpc timeout'))
+      .mockResolvedValueOnce([]);
+
+    await service.pollEvents();
+    await service.pollEvents();
+
+    expect(mockStellar.fetchContractEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the lock even when event processing throws', async () => {
+    mockStellar.fetchContractEvents
+      .mockResolvedValueOnce([{ ledger: 101, topic: ['course_paused'], value: 'C-1' }])
+      .mockResolvedValueOnce([]);
+    (mockPrisma as any).course = {
+      updateMany: jest.fn().mockRejectedValue(new Error('db write failed')),
+    };
+
+    await service.pollEvents();
+    await service.pollEvents();
+
+    expect(mockStellar.fetchContractEvents).toHaveBeenCalledTimes(2);
   });
 });

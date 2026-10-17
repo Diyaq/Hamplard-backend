@@ -5,7 +5,19 @@ import {
 import { UserRole } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { AssignmentStatus, NotificationType } from '@prisma/client';
+import { AssignmentStatus, EnrollmentStatus, NotificationType } from '@prisma/client';
+
+/** Enrollment states allowed to submit assignments (issue #244). */
+const SUBMITTABLE_ENROLLMENT_STATUSES: EnrollmentStatus[] = [
+  EnrollmentStatus.ACTIVE,
+  EnrollmentStatus.COMPLETED,
+];
+
+/** Authenticated caller as attached by JwtStrategy. */
+export interface AssignmentViewer {
+  id: string;
+  role: UserRole | string;
+}
 
 @Injectable()
 export class AssignmentsService {
@@ -63,13 +75,36 @@ export class AssignmentsService {
     });
   }
 
-  async findByLesson(lessonId: string) {
+  /**
+   * Issue #244 — the course instructor and admins see every submission;
+   * anyone else only sees their own.
+   */
+  async findByLesson(lessonId: string, user: AssignmentViewer) {
     const assignment = await this.prisma.assignment.findUnique({
       where: { lessonId },
-      include: { submissions: { include: { student: { select: { name: true, stellarAddress: true } } } } },
+      include: {
+        submissions: { include: { student: { select: { name: true, stellarAddress: true } } } },
+        lesson: {
+          select: {
+            module: {
+              select: { course: { select: { instructor: { select: { id: true } } } } },
+            },
+          },
+        },
+      },
     });
     if (!assignment) throw new NotFoundException('Assignment not found for this lesson');
-    return assignment;
+
+    const { lesson, submissions, ...rest } = assignment;
+    const canSeeAll =
+      user.role === UserRole.ADMIN || lesson?.module?.course?.instructor?.id === user.id;
+
+    return {
+      ...rest,
+      submissions: canSeeAll
+        ? submissions
+        : submissions.filter((s) => s.studentId === user.id),
+    };
   }
 
   /**
@@ -83,6 +118,27 @@ export class AssignmentsService {
     submissionUrl: string,
     notes?: string,
   ) {
+    // Issue #244 — unknown IDs are a 404 (not an FK error), and only students
+    // enrolled in the parent course may submit.
+    const assignment = await this.prisma.assignment.findUnique({
+      where: { id: assignmentId },
+      select: {
+        id: true,
+        lesson: { select: { module: { select: { courseId: true } } } },
+      },
+    });
+    if (!assignment) throw new NotFoundException('Assignment not found');
+
+    const enrollment = await this.prisma.enrollment.findUnique({
+      where: {
+        studentId_courseId: { studentId, courseId: assignment.lesson.module.courseId },
+      },
+      select: { status: true },
+    });
+    if (!enrollment || !SUBMITTABLE_ENROLLMENT_STATUSES.includes(enrollment.status)) {
+      throw new ForbiddenException('You must be enrolled in this course to submit this assignment');
+    }
+
     const existing = await this.prisma.assignmentSubmission.findUnique({
       where: { assignmentId_studentId: { assignmentId, studentId } },
     });

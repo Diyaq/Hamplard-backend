@@ -1,5 +1,6 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -11,6 +12,12 @@ export const EVENT_POLLER_CHECKPOINT_KEY = 'stellar-event-poller';
 
 /** Number of ledgers to rewind behind the chain tip on a cold start. */
 const COLD_START_LOOKBACK = 10;
+
+/** SchedulerRegistry name of the poll interval (issue #229). */
+export const EVENT_POLLER_INTERVAL_NAME = 'stellar-event-poller';
+
+/** Poll interval used when EVENT_POLLING_INTERVAL_MS is unset or invalid. */
+export const DEFAULT_EVENT_POLLING_INTERVAL_MS = 5000;
 
 export interface CheckpointStatus {
   key: string;
@@ -30,11 +37,12 @@ export interface CheckpointStatus {
 /**
  * EventsService
  *
- * Polls Stellar RPC every 5 seconds for Hamplard contract events:
+ * Polls Stellar RPC every EVENT_POLLING_INTERVAL_MS (default 5s) for Hamplard
+ * contract events:
  *
  *   - course_registered    → log, backend already has the record from POST /courses
  *   - course_approved      → update course status in DB
- *   - student_enrolled     → update enrollment + course stats (safety net)
+ *   - student_enrolled     → reconcile with the API enrollment (no double counting)
  *   - course_completed     → trigger certificate issuance flow
  *   - certificate_issued   → update DB txHash, notify student
  *   - certificate_revoked  → update DB flag
@@ -46,9 +54,12 @@ export interface CheckpointStatus {
  * restart or crash does not skip events that landed while the process was down.
  */
 @Injectable()
-export class EventsService implements OnModuleInit {
+export class EventsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(EventsService.name);
   private lastProcessedLedger = 0;
+
+  /** Re-entrancy guard — true while a poll is running (issue #229). */
+  private isPolling = false;
 
   // Checkpoint bookkeeping (in-memory mirror of the DB row).
   private resumedFromCheckpoint = false;
@@ -61,9 +72,40 @@ export class EventsService implements OnModuleInit {
     private readonly stellar: StellarService,
     private readonly notifications: NotificationsService,
     private readonly courses: CoursesService,
+    private readonly config: ConfigService,
+    private readonly schedulerRegistry: SchedulerRegistry,
   ) {}
 
   async onModuleInit() {
+    await this.initCheckpoint();
+    this.startPolling();
+  }
+
+  onModuleDestroy() {
+    if (this.schedulerRegistry.doesExist('interval', EVENT_POLLER_INTERVAL_NAME)) {
+      this.schedulerRegistry.deleteInterval(EVENT_POLLER_INTERVAL_NAME);
+    }
+  }
+
+  /** Poll interval from EVENT_POLLING_INTERVAL_MS, falling back to 5000 ms. */
+  getPollingIntervalMs(): number {
+    const raw = Number(this.config.get('EVENT_POLLING_INTERVAL_MS'));
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EVENT_POLLING_INTERVAL_MS;
+  }
+
+  /** Registers the poll loop with SchedulerRegistry (replaces the fixed 5s @Cron). */
+  private startPolling(): void {
+    if (this.schedulerRegistry.doesExist('interval', EVENT_POLLER_INTERVAL_NAME)) return;
+
+    const intervalMs = this.getPollingIntervalMs();
+    const interval = setInterval(() => {
+      void this.pollEvents();
+    }, intervalMs);
+    this.schedulerRegistry.addInterval(EVENT_POLLER_INTERVAL_NAME, interval);
+    this.logger.log(`Event poller scheduled every ${intervalMs} ms`);
+  }
+
+  private async initCheckpoint() {
     const checkpoint = await this.loadCheckpoint();
     let latestLedger: number | null = null;
     try {
@@ -101,8 +143,15 @@ export class EventsService implements OnModuleInit {
     await this.persistCheckpoint();
   }
 
-  @Cron(CronExpression.EVERY_5_SECONDS)
   async pollEvents() {
+    // Issue #229 — a slow RPC/DB round-trip must not let ticks overlap, which
+    // would process the same ledger range twice.
+    if (this.isPolling) {
+      this.logger.debug('Previous event poll still running; skipping this tick');
+      return;
+    }
+    this.isPolling = true;
+
     try {
       const events = await this.stellar.fetchContractEvents(this.lastProcessedLedger);
 
@@ -120,7 +169,11 @@ export class EventsService implements OnModuleInit {
       // Persist progress even when a poll finds nothing — a checkpoint write
       // failure is logged but never allowed to stop the poll loop.
       this.lastPolledAt = new Date();
-      await this.persistCheckpoint();
+      try {
+        await this.persistCheckpoint();
+      } finally {
+        this.isPolling = false;
+      }
     }
   }
 
@@ -277,14 +330,36 @@ export class EventsService implements OnModuleInit {
       : [payload, null, null];
 
     this.logger.log(`Student enrolled on-chain: ${studentAddress} → ${courseId}`);
-    // Enrollment is primarily registered via POST /enrollments from the frontend.
-    // This handler updates course stats as a safety net.
-    if (courseId) {
-      await this.prisma.course.updateMany({
-        where: { id: String(courseId) },
-        data: { totalEnrollments: { increment: 1 } },
-      });
+    // Issue #231 — EnrollmentsService.create() (POST /enrollments) owns the
+    // enrollment row and the totalEnrollments/totalRevenue increment. This
+    // handler only reconciles, so a (student, course) pair is never counted
+    // twice — including when the same event is replayed after a restart.
+    if (!courseId || !studentAddress) return;
+
+    const student = await this.prisma.user.findUnique({
+      where: { stellarAddress: String(studentAddress) },
+      select: { id: true },
+    });
+    const enrollment = student
+      ? await this.prisma.enrollment.findUnique({
+          where: { studentId_courseId: { studentId: student.id, courseId: String(courseId) } },
+          select: { id: true },
+        })
+      : null;
+
+    if (enrollment) {
+      this.logger.debug(
+        `Enrollment ${enrollment.id} already registered via API; skipping stat update`,
+      );
+      return;
     }
+
+    // No backend record yet — POST /enrollments creates it and updates the
+    // stats when it lands, so incrementing here would double count.
+    this.logger.warn(
+      `On-chain enrollment ${studentAddress} → ${courseId} has no backend record yet; ` +
+        'awaiting API registration',
+    );
   }
 
   private async handleCourseCompleted(payload: any) {
