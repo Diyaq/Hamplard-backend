@@ -1,4 +1,4 @@
-import { UnauthorizedException } from '@nestjs/common';
+import { ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 import { GoogleAuthService, GoogleIdentity } from './google-auth.service';
 
 describe('GoogleAuthService', () => {
@@ -142,5 +142,45 @@ describe('GoogleAuthService', () => {
       data: expect.objectContaining({ googleId: identity.googleId }),
     });
     expect(prisma.user.create).not.toHaveBeenCalled();
+  });
+
+  describe('when Google credentials are configured', () => {
+    it('is enabled and does not throw from assertEnabled', () => {
+      const service = buildService();
+
+      expect(service.enabled).toBe(true);
+      expect(() => service.assertEnabled()).not.toThrow();
+    });
+  });
+
+  describe('when Google credentials are missing', () => {
+    beforeEach(() => {
+      config.get.mockImplementation((key: string) =>
+        key === 'GOOGLE_CLIENT_ID' ? 'google-client-id' : undefined,
+      );
+    });
+
+    it('constructs without throwing and is disabled', () => {
+      const service = buildService();
+
+      expect(service.enabled).toBe(false);
+    });
+
+    it('is disabled when only the secret is set', () => {
+      config.get.mockImplementation((key: string) =>
+        key === 'GOOGLE_CLIENT_SECRET' ? 'google-client-secret' : undefined,
+      );
+
+      expect(buildService().enabled).toBe(false);
+    });
+
+    it('rejects ID token login with 503 "not configured"', async () => {
+      const service = buildService();
+
+      await expect(service.loginWithIdToken('any-token')).rejects.toThrow(
+        new ServiceUnavailableException('Google authentication is not configured'),
+      );
+      expect(prisma.user.create).not.toHaveBeenCalled();
+    });
   });
 });

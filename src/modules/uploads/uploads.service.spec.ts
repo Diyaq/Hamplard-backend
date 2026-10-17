@@ -5,6 +5,8 @@ import * as fs from 'fs';
 import { CdnService } from './cdn.service';
 import { UploadsService } from './uploads.service';
 import { VirusScanService } from './virus-scan.service';
+import { VideoTranscodeService } from './video-transcode.service';
+import { VideoThumbnailService } from './video-thumbnail.service';
 
 jest.mock('clamscan', () => {
   return jest.fn().mockImplementation(() => {
@@ -37,6 +39,18 @@ describe('UploadsService (CDN integration)', () => {
             scanFile: jest.fn().mockResolvedValue(undefined),
             getScanStatus: jest.fn(),
           },
+        },
+        // Stubbed so no BullMQ/Redis queue or ffmpeg process is touched.
+        {
+          provide: VideoTranscodeService,
+          useValue: {
+            validateVideoFormat: jest.fn(),
+            addTranscodeJob: jest.fn().mockResolvedValue('job-1'),
+          },
+        },
+        {
+          provide: VideoThumbnailService,
+          useValue: { extractThumbnail: jest.fn() },
         },
         {
           provide: ConfigService,

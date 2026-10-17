@@ -48,7 +48,14 @@ import { ThrottlerModule } from '@nestjs/throttler';
     CaptchaService,
     JwtStrategy,
     GoogleAuthService,
-    GoogleStrategy,
+    {
+      // Only register the Passport 'google' strategy when credentials exist;
+      // passport-google-oauth20 throws on a missing clientID.
+      provide: GoogleStrategy,
+      inject: [ConfigService, GoogleAuthService],
+      useFactory: (config: ConfigService, googleAuth: GoogleAuthService) =>
+        googleAuth.enabled ? new GoogleStrategy(config, googleAuth) : null,
+    },
     GoogleAuthGuard,
     OtpService,
     SessionsService,

@@ -1,7 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { UnauthorizedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { OtpService, TooManyRequestsException } from './otp.service';
 import { PrismaService } from '../../common/prisma/prisma.service';
+
+// Stub the Africa's Talking SDK so sendOtp never makes a real HTTP request.
+const mockSmsSend = jest.fn().mockResolvedValue({ SMSMessageData: { Recipients: [] } });
+jest.mock('africastalking', () => jest.fn(() => ({ SMS: { send: mockSmsSend } })));
 
 describe('OtpService', () => {
   let service: OtpService;
@@ -87,6 +92,10 @@ describe('OtpService', () => {
           expiresAt: expect.any(Date),
         }),
       });
+
+      expect(mockSmsSend).toHaveBeenCalledWith(
+        expect.objectContaining({ to: ['+254712345678'], from: 'TestSender' }),
+      );
     });
 
     it('should enforce rate limiting', async () => {

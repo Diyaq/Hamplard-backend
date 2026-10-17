@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { HttpException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { EnrollmentsService } from './enrollments.service';
 import { FraudDetectionService } from './fraud-detection.service';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -62,7 +63,7 @@ describe('EnrollmentsService - Fraud HOLD handling', () => {
         { provide: ReferralsService, useValue: mockReferrals },
         { provide: DripScheduleService, useValue: mockDripSchedule },
         {
-          provide: 'ConfigService',
+          provide: ConfigService,
           useValue: {
             get: jest.fn((key: string, defaultValue?: any) => defaultValue),
           },
@@ -78,6 +79,8 @@ describe('EnrollmentsService - Fraud HOLD handling', () => {
 
   it('persists a HELD fraud flag and throws 423 when an enrollment is blocked by fraud check', async () => {
     mockPrisma.enrollment.findUnique.mockResolvedValue(null);
+    // checkPrerequisites() requires the target course to exist
+    mockPrisma.course.findUnique.mockResolvedValue({ id: 'course-1', title: 'Course 1' });
     mockPrisma.coursePrerequisite.findMany.mockResolvedValue([]);
 
     const heldFlagId = 'flag-held-uuid-1';

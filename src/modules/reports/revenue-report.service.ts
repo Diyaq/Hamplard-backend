@@ -4,7 +4,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { RevenueReportQueryDto } from './dto/revenue-report-query.dto';
 import { EnrollmentStatus } from '@prisma/client';
 
-interface CourseBucket {
+export interface CourseBucket {
   courseId: string;
   courseTitle: string;
   instructorAddress: string;
@@ -16,7 +16,7 @@ interface CourseBucket {
   instructorNet: number;
 }
 
-interface InstructorBucket {
+export interface InstructorBucket {
   instructorAddress: string;
   instructorId: string | null;
   instructorName: string | null;

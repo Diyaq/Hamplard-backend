@@ -25,7 +25,7 @@ export class AssignmentsService {
       include: {
         module: {
           include: {
-            course: true,
+            course: { include: { instructor: { select: { id: true } } } },
           },
         },
       },
@@ -37,7 +37,8 @@ export class AssignmentsService {
 
     if (userRole !== UserRole.ADMIN) {
       const course = lesson.module.course;
-      if (course.instructorAddress !== userId && course.instructor?.id !== userId) {
+      // userId is a User UUID; course.instructorAddress is a Stellar address, so compare by id.
+      if (course.instructor?.id !== userId) {
         throw new ForbiddenException('You are not authorized to manage assignments for this course');
       }
     }
@@ -150,7 +151,7 @@ export class AssignmentsService {
               include: {
                 module: {
                   include: {
-                    course: true,
+                    course: { include: { instructor: { select: { id: true } } } },
                   },
                 },
               },
@@ -164,7 +165,7 @@ export class AssignmentsService {
     // Verify ownership
     if (userRole !== UserRole.ADMIN) {
       const course = submission.assignment.lesson.module.course;
-      if (course.instructorAddress !== instructorId && course.instructor?.id !== instructorId) {
+      if (course.instructor?.id !== instructorId) {
         throw new ForbiddenException('You are not authorized to review assignments for this course');
       }
     }
