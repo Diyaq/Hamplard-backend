@@ -17,7 +17,9 @@ describe('HealthController (Issue #80 — checkpoint via health endpoint)', () =
   const healthyStatus: CheckpointStatus = {
     key: 'stellar-event-poller',
     lastProcessedLedger: 5123,
+    lastProcessedCursor: null,
     persistedLedger: 5123,
+    persistedCursor: null,
     lastPolledAt: new Date('2026-08-27T12:00:00Z'),
     resumedFromCheckpoint: true,
     consecutiveWriteFailures: 0,

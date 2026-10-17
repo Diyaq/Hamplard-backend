@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../common/prisma/prisma.service';
-import { StellarService } from '../../common/stellar/stellar.service';
+import { CONTRACT_EVENT_PAGE_LIMIT, StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationType } from '@prisma/client';
@@ -16,8 +16,11 @@ export interface CheckpointStatus {
   key: string;
   /** Ledger the running process will poll from next. */
   lastProcessedLedger: number;
+  /** Token of the last event processed while a ledger range is being drained. */
+  lastProcessedCursor: string | null;
   /** Ledger currently persisted in the database (null if never written). */
   persistedLedger: number | null;
+  persistedCursor: string | null;
   lastPolledAt: Date | null;
   /** How the poller obtained its starting ledger on the last boot. */
   resumedFromCheckpoint: boolean;
@@ -41,14 +44,14 @@ export interface CheckpointStatus {
  *   - course_paused        → update course status
  *   - course_archived      → update course status
  *
- * The last processed Stellar ledger is persisted to the `event_poller_checkpoints`
- * table after every poll. On boot the service resumes from that checkpoint so a
- * restart or crash does not skip events that landed while the process was down.
+ * The event cursor is persisted after each event. Once all available pages are
+ * drained, the checkpoint moves to the next ledger and clears the cursor.
  */
 @Injectable()
 export class EventsService implements OnModuleInit {
   private readonly logger = new Logger(EventsService.name);
   private lastProcessedLedger = 0;
+  private lastProcessedCursor: string | null = null;
 
   // Checkpoint bookkeeping (in-memory mirror of the DB row).
   private resumedFromCheckpoint = false;
@@ -77,6 +80,7 @@ export class EventsService implements OnModuleInit {
       // tip (e.g. restored from another network) — fall back to a cold start.
       if (latestLedger !== null && checkpoint.lastProcessedLedger > latestLedger + 1) {
         this.lastProcessedLedger = Math.max(1, latestLedger - COLD_START_LOOKBACK);
+        this.lastProcessedCursor = null;
         this.resumedFromCheckpoint = false;
         this.logger.warn(
           `Persisted checkpoint ledger ${checkpoint.lastProcessedLedger} is ahead of ` +
@@ -85,9 +89,10 @@ export class EventsService implements OnModuleInit {
         );
       } else {
         this.lastProcessedLedger = checkpoint.lastProcessedLedger;
+        this.lastProcessedCursor = checkpoint.lastProcessedCursor;
         this.resumedFromCheckpoint = true;
         this.logger.log(
-          `Resumed event poller from persisted ledger ${this.lastProcessedLedger}`,
+          `Resumed event poller from persisted ${this.lastProcessedCursor ? 'event cursor' : `ledger ${this.lastProcessedLedger}`}`,
         );
       }
       return;
@@ -104,16 +109,41 @@ export class EventsService implements OnModuleInit {
   @Cron(CronExpression.EVERY_5_SECONDS)
   async pollEvents() {
     try {
-      const events = await this.stellar.fetchContractEvents(this.lastProcessedLedger);
+      // RPC rejects a start ledger beyond its current tip. A cursor already
+      // identifies an event within the retained range, so it needs no check.
+      if (!this.lastProcessedCursor && this.lastProcessedLedger > await this.stellar.getLatestLedger()) {
+        return;
+      }
 
-      if (events.length) {
-        this.logger.log(`Processing ${events.length} chain event(s)`);
-
+      let count = 0;
+      while (true) {
+        const page = await this.stellar.fetchContractEvents(
+          this.lastProcessedLedger,
+          this.lastProcessedCursor ?? undefined,
+        );
+        const events = page.events ?? [];
         for (const event of events) {
+          if (!event.pagingToken || event.pagingToken === this.lastProcessedCursor) {
+            throw new Error('RPC event has no advancing paging token');
+          }
           await this.processEvent(event);
           this.lastProcessedLedger = Math.max(this.lastProcessedLedger, event.ledger + 1);
+          this.lastProcessedCursor = event.pagingToken;
+          // A crash in the middle of a full page must resume at this event,
+          // rather than skipping the rest of its ledger.
+          await this.persistCheckpoint();
+          count += 1;
+        }
+
+        if (events.length < CONTRACT_EVENT_PAGE_LIMIT) {
+          // The range through latestLedger has been fully scanned. Start at
+          // the next ledger so an idle poller never holds an expiring cursor.
+          this.lastProcessedLedger = Math.max(this.lastProcessedLedger, page.latestLedger + 1);
+          this.lastProcessedCursor = null;
+          break;
         }
       }
+      if (count) this.logger.log(`Processed ${count} chain event(s)`);
     } catch (error) {
       this.logger.error('Event polling failed', error.message);
     } finally {
@@ -141,7 +171,7 @@ export class EventsService implements OnModuleInit {
   }
 
   /**
-   * Write the current ledger to the checkpoint row. Best-effort: a failure
+   * Write the current event position to the checkpoint row. Best-effort: a failure
    * increments the failure counter and is surfaced via the health endpoint,
    * but is swallowed so polling keeps running.
    */
@@ -152,10 +182,12 @@ export class EventsService implements OnModuleInit {
         create: {
           key: EVENT_POLLER_CHECKPOINT_KEY,
           lastProcessedLedger: this.lastProcessedLedger,
+          lastProcessedCursor: this.lastProcessedCursor,
           lastPolledAt: this.lastPolledAt,
         },
         update: {
           lastProcessedLedger: this.lastProcessedLedger,
+          lastProcessedCursor: this.lastProcessedCursor,
           lastPolledAt: this.lastPolledAt,
           lastWriteError: null,
           consecutiveWriteFailures: 0,
@@ -167,7 +199,7 @@ export class EventsService implements OnModuleInit {
       this.consecutiveWriteFailures += 1;
       this.lastWriteError = error?.message ?? String(error);
       this.logger.error(
-        `Failed to persist ledger checkpoint (consecutive failure ` +
+        `Failed to persist event checkpoint (consecutive failure ` +
           `#${this.consecutiveWriteFailures}); polling continues`,
         this.lastWriteError,
       );
@@ -201,7 +233,9 @@ export class EventsService implements OnModuleInit {
     return {
       key: EVENT_POLLER_CHECKPOINT_KEY,
       lastProcessedLedger: this.lastProcessedLedger,
+      lastProcessedCursor: this.lastProcessedCursor,
       persistedLedger: persisted?.lastProcessedLedger ?? null,
+      persistedCursor: persisted?.lastProcessedCursor ?? null,
       lastPolledAt: persisted?.lastPolledAt ?? this.lastPolledAt,
       resumedFromCheckpoint: this.resumedFromCheckpoint,
       consecutiveWriteFailures: this.consecutiveWriteFailures,
