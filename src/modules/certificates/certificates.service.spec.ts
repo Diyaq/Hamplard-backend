@@ -4,6 +4,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ExamsService } from '../exams/exams.service';
+import { CertificatePdfService } from './certificate-pdf.service';
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 
 const mockPrisma = {
@@ -34,6 +35,10 @@ const mockExams = {
   hasPassedExam: jest.fn().mockResolvedValue(true),
 };
 
+const mockPdf = {
+  renderForCategory: jest.fn().mockResolvedValue(Buffer.from('%PDF-mock')),
+};
+
 const MOCK_ENROLLMENT = {
   id:             'enroll-1',
   studentId:      'student-1',
@@ -56,6 +61,7 @@ describe('CertificatesService', () => {
         { provide: StellarService,       useValue: mockStellar },
         { provide: NotificationsService, useValue: mockNotifications },
         { provide: ExamsService,         useValue: mockExams },
+        { provide: CertificatePdfService, useValue: mockPdf },
       ],
     }).compile();
 
@@ -67,7 +73,7 @@ describe('CertificatesService', () => {
     it('issues a certificate for a completed enrollment', async () => {
       mockPrisma.enrollment.findUnique.mockResolvedValue(MOCK_ENROLLMENT);
       mockPrisma.certificate.findFirst.mockResolvedValue(null);
-      mockPrisma.certificate.create.mockResolvedValue({
+      const created = {
         id:              'CERT-ABC123',
         studentId:       'student-1',
         courseId:        'COURSE-TAILORING-001',
@@ -77,10 +83,17 @@ describe('CertificatesService', () => {
         issuedAt:        new Date(),
         student:         MOCK_ENROLLMENT.student,
         course:          MOCK_ENROLLMENT.course,
-      });
+      };
+      mockPrisma.certificate.create.mockResolvedValue(created);
+      // issue() renders the PDF and returns the row updated with its pdfUrl
+      mockPrisma.certificate.update.mockImplementation(({ data }) =>
+        Promise.resolve({ ...created, ...data }),
+      );
 
       const result = await service.issue('admin-1', 'student-1', 'COURSE-TAILORING-001');
       expect(result.courseTitle).toBe('Professional Tailoring');
+      expect(mockPdf.renderForCategory).toHaveBeenCalledTimes(1);
+      expect(result.pdfUrl).toMatch(/^certificates\/.+\.pdf$/);
       expect(mockNotifications.notifyUser).toHaveBeenCalledTimes(1);
     });
 

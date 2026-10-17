@@ -26,6 +26,9 @@ export class GoogleAuthGuard extends AuthGuard('google') {
   }
 
   canActivate(context: ExecutionContext) {
+    // Bail out before Passport runs: the 'google' strategy is not registered when disabled.
+    this.googleAuth.assertEnabled();
+
     const request = context.switchToHttp().getRequest();
     if (request.path.endsWith('/callback')) {
       const state = request.query?.state;

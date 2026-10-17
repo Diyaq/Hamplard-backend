@@ -4,6 +4,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { FeeCalculatorService } from '../billing/fee-calculator.service';
 import { SearchService } from '../search/search.service';
+import { CacheService } from '../../common/cache/cache.service';
 import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { CourseStatus } from '@prisma/client';
 
@@ -37,6 +38,15 @@ const mockSearchService = {
   }),
 };
 
+// In-memory stand-in so the spec never opens a Redis connection.
+const mockCache = {
+  buildKey: jest.fn((ns: string) => `cache:${ns}`),
+  get: jest.fn().mockResolvedValue(null),
+  set: jest.fn().mockResolvedValue(undefined),
+  del: jest.fn().mockResolvedValue(undefined),
+  invalidateNamespace: jest.fn().mockResolvedValue(undefined),
+};
+
 const MOCK_COURSE = {
   id:                'COURSE-TAILORING-001',
   instructorAddress: 'GABC',
@@ -62,6 +72,7 @@ describe('CoursesService', () => {
         { provide: PrismaService,       useValue: mockPrisma },
         { provide: NotificationsService, useValue: mockNotifications },
         { provide: SearchService, useValue: mockSearchService },
+        { provide: CacheService, useValue: mockCache },
         FeeCalculatorService,
       ],
     }).compile();

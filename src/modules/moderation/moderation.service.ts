@@ -49,15 +49,17 @@ export class ModerationService {
       },
     });
 
-    // Check pending flags threshold for automatic unpublish/hide
-    const pendingCount = await this.prisma.abuseReport.count({
+    // Check pending flags threshold for automatic unpublish/hide.
+    // count() does not support distinct, so group by reporter and count the groups.
+    const reporterGroups = await this.prisma.abuseReport.groupBy({
+      by: ['reporterId'],
       where: {
         targetType: dto.targetType,
         targetId: dto.targetId,
         status: { in: [ReportStatus.PENDING, ReportStatus.UNDER_REVIEW] },
       },
-      distinct: ['reporterId'],
     });
+    const pendingCount = reporterGroups.length;
 
     let autoActionTaken = false;
     if (pendingCount >= DEFAULT_UNPUBLISH_THRESHOLD) {

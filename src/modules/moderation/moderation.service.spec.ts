@@ -4,10 +4,14 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { ReportCategory, ReportTargetType, ReportStatus, CourseStatus } from '@prisma/client';
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 
+/** groupBy({ by: ['reporterId'] }) result: one row per distinct reporter. */
+const reporterGroups = (n: number) =>
+  Array.from({ length: n }, (_, i) => ({ reporterId: `user-${i + 1}` }));
+
 const mockPrisma = {
   abuseReport: {
     create: jest.fn(),
-    count: jest.fn(),
+    groupBy: jest.fn(),
     findFirst: jest.fn(),
     findUnique: jest.fn(),
     update: jest.fn(),
@@ -48,7 +52,7 @@ describe('ModerationService', () => {
         category: ReportCategory.SPAM,
         status: ReportStatus.PENDING,
       });
-      mockPrisma.abuseReport.count.mockResolvedValue(1);
+      mockPrisma.abuseReport.groupBy.mockResolvedValue(reporterGroups(1));
 
       const result = await service.createFlag('user-1', {
         targetType: ReportTargetType.COURSE,
@@ -70,7 +74,7 @@ describe('ModerationService', () => {
         category: ReportCategory.HARASSMENT,
         status: ReportStatus.PENDING,
       });
-      mockPrisma.abuseReport.count.mockResolvedValue(3);
+      mockPrisma.abuseReport.groupBy.mockResolvedValue(reporterGroups(3));
       mockPrisma.course.findUnique.mockResolvedValue({
         id: 'course-1',
         status: CourseStatus.ACTIVE,
@@ -124,7 +128,7 @@ describe('ModerationService', () => {
         category: ReportCategory.HARASSMENT,
         status: ReportStatus.PENDING,
       });
-      mockPrisma.abuseReport.count.mockResolvedValue(3);
+      mockPrisma.abuseReport.groupBy.mockResolvedValue(reporterGroups(3));
 
       await service.createFlag('user-3', {
         targetType: ReportTargetType.COURSE,
@@ -132,13 +136,13 @@ describe('ModerationService', () => {
         category: ReportCategory.HARASSMENT,
       });
 
-      expect(mockPrisma.abuseReport.count).toHaveBeenCalledWith({
+      expect(mockPrisma.abuseReport.groupBy).toHaveBeenCalledWith({
+        by: ['reporterId'],
         where: {
           targetType: ReportTargetType.COURSE,
           targetId: 'course-1',
           status: { in: [ReportStatus.PENDING, ReportStatus.UNDER_REVIEW] },
         },
-        distinct: ['reporterId'],
       });
     });
 

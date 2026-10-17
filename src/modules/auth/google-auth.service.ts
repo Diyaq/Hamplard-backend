@@ -1,6 +1,8 @@
 import {
   ConflictException,
   Injectable,
+  Logger,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -21,9 +23,11 @@ export interface GoogleIdentity {
 
 @Injectable()
 export class GoogleAuthService {
-  private readonly googleClient: OAuth2Client;
+  private readonly logger = new Logger(GoogleAuthService.name);
+  private readonly googleClient?: OAuth2Client;
   private readonly clientId?: string;
   private readonly oauthStates = new Map<string, number>();
+  readonly enabled: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -33,10 +37,21 @@ export class GoogleAuthService {
     config: ConfigService,
   ) {
     this.clientId = config.get<string>('GOOGLE_CLIENT_ID');
-    if (!this.clientId || !config.get<string>('GOOGLE_CLIENT_SECRET')) {
-      throw new Error('Google authentication requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET');
+    this.enabled = Boolean(this.clientId && config.get<string>('GOOGLE_CLIENT_SECRET'));
+    if (!this.enabled) {
+      this.logger.warn(
+        'GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google authentication is disabled',
+      );
+      return;
     }
     this.googleClient = new OAuth2Client(this.clientId);
+  }
+
+  /** Throws 503 when Google credentials are not configured. */
+  assertEnabled(): void {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('Google authentication is not configured');
+    }
   }
 
   createOAuthState(): string {
@@ -52,13 +67,11 @@ export class GoogleAuthService {
   }
 
   async verifyIdToken(idToken: string): Promise<GoogleIdentity> {
-    if (!this.clientId) {
-      throw new UnauthorizedException('Google authentication is not configured');
-    }
+    this.assertEnabled();
 
     let payload: TokenPayload | undefined;
     try {
-      const ticket = await this.googleClient.verifyIdToken({ idToken, audience: this.clientId });
+      const ticket = await this.googleClient!.verifyIdToken({ idToken, audience: this.clientId });
       payload = ticket.getPayload();
     } catch {
       throw new UnauthorizedException('Invalid Google ID token');
