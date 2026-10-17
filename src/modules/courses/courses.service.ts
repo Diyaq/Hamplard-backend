@@ -284,8 +284,69 @@ export class CoursesService {
   }
 
   // ----------------------------------------------------------
+  // STATUS TRANSITIONS (issue #232)
+  // ----------------------------------------------------------
+  // Used by on-chain event sync and auto-moderation. Each transition keeps
+  // the Meilisearch index and the Redis course-list caches in step with the
+  // DB status: only ACTIVE courses are indexed.
+
+  /** Marks a course ACTIVE, indexes it for search and purges list caches. */
+  async approveCourse(courseId: string): Promise<boolean> {
+    const { count } = await this.prisma.course.updateMany({
+      where: { id: courseId },
+      data: { status: CourseStatus.ACTIVE, approvedAt: new Date() },
+    });
+    if (!count) {
+      this.logger.warn(`approveCourse: course ${courseId} not found`);
+      return false;
+    }
+
+    await this.indexCourseForSearch(courseId);
+    await this.invalidateCourseCaches();
+    this.logger.log(`Course ${courseId} → ACTIVE (indexed for search)`);
+    return true;
+  }
+
+  /** Marks a course PAUSED, removes it from search and purges list caches. */
+  async pauseCourse(courseId: string): Promise<boolean> {
+    return this.delistCourse(courseId, CourseStatus.PAUSED);
+  }
+
+  /** Marks a course ARCHIVED, removes it from search and purges list caches. */
+  async archiveCourse(courseId: string): Promise<boolean> {
+    return this.delistCourse(courseId, CourseStatus.ARCHIVED);
+  }
+
+  private async delistCourse(courseId: string, status: CourseStatus): Promise<boolean> {
+    const { count } = await this.prisma.course.updateMany({
+      where: { id: courseId },
+      data: { status },
+    });
+    if (!count) {
+      this.logger.warn(`Cannot set course ${courseId} to ${status}: not found`);
+      return false;
+    }
+
+    await this.removeCourseFromSearch(courseId);
+    await this.invalidateCourseCaches();
+    this.logger.log(`Course ${courseId} → ${status} (removed from search)`);
+    return true;
+  }
+
+  // ----------------------------------------------------------
   // SEARCH INDEX HELPERS
   // ----------------------------------------------------------
+
+  /** Removes a course from the search index; failures are logged, not thrown. */
+  private async removeCourseFromSearch(courseId: string): Promise<void> {
+    try {
+      await this.searchService.removeCourse(courseId);
+    } catch (err) {
+      this.logger.error(
+        `Failed to remove course ${courseId} from search index: ${(err as Error).message}`,
+      );
+    }
+  }
 
   /**
    * Builds a search document from the course in the database and

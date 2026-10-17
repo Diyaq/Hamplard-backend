@@ -1,5 +1,5 @@
 import { Controller, Get, Patch, Post, Body, Param, UseGuards, Req } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiBearerAuth, ApiOkResponse } from '@nestjs/swagger';
 import { UsersService } from './users.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../../common/guards/roles.guard';
@@ -12,6 +12,7 @@ import { UnsuspendUserDto } from './dto/unsuspend-user.dto';
 import { Request } from 'express';
 
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { PublicUserDto } from './dto/public-user.dto';
 
 @ApiTags('users')
 @ApiBearerAuth()
@@ -37,8 +38,9 @@ export class UsersController {
 
   @Get(':address/public')
   @ApiOperation({ summary: 'Get public instructor profile by Stellar address' })
-  getPublicProfile(@Param('address') address: string) {
-    return this.usersService.findByAddress(address);
+  @ApiOkResponse({ type: PublicUserDto })
+  getPublicProfile(@Param('address') address: string): Promise<PublicUserDto> {
+    return this.usersService.getPublicProfile(address);
   }
 
   @Get('me/instructor-stats')

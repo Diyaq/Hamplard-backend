@@ -9,6 +9,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { CreateFlagDto } from './dto/create-flag.dto';
 import { ResolveFlagDto } from './dto/resolve-flag.dto';
 import { ReportStatus, ReportTargetType, CourseStatus, ReportCategory } from '@prisma/client';
+import { CoursesService } from '../courses/courses.service';
 
 export const DEFAULT_UNPUBLISH_THRESHOLD = 3;
 
@@ -16,7 +17,10 @@ export const DEFAULT_UNPUBLISH_THRESHOLD = 3;
 export class ModerationService {
   private readonly logger = new Logger(ModerationService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly courses: CoursesService,
+  ) {}
 
   async createFlag(reporterId: string, dto: CreateFlagDto) {
     if (!Object.values(ReportCategory).includes(dto.category)) {
@@ -78,12 +82,12 @@ export class ModerationService {
       if (targetType === ReportTargetType.COURSE) {
         const course = await this.prisma.course.findUnique({ where: { id: targetId } });
         if (course && course.status !== CourseStatus.PAUSED) {
-          await this.prisma.course.update({
-            where: { id: targetId },
-            data: { status: CourseStatus.PAUSED },
-          });
-          this.logger.warn(`Course ${targetId} automatically paused due to flag threshold reach`);
-          return true;
+          // Issue #232 — pauseCourse also drops the course from search and caches
+          const paused = await this.courses.pauseCourse(targetId);
+          if (paused) {
+            this.logger.warn(`Course ${targetId} automatically paused due to flag threshold reach`);
+          }
+          return paused;
         }
       } else if (targetType === ReportTargetType.COMMENT) {
         const comment = await this.prisma.discussionComment.findUnique({ where: { id: targetId } });

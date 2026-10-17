@@ -6,6 +6,7 @@ import { ReferralsService } from '../referrals/referrals.service';
 import { RefreshTokenService, TokenPair } from './refresh-token.service';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
 import { SessionsService, DeviceMetadata } from './sessions.service';
+import { SafeUser, toSafeUser } from '../users/user-serializer';
 
 import { TwoFactorService } from './two-factor.service';
 
@@ -118,7 +119,7 @@ export class AuthService {
     role?: 'STUDENT' | 'INSTRUCTOR';
     referralCode?: string;
     totpCode?: string;
-  }, deviceMeta?: DeviceMetadata): Promise<TokenPair & { user: any }> {
+  }, deviceMeta?: DeviceMetadata): Promise<TokenPair & { user: SafeUser }> {
     const { stellarAddress, signedNonce, signature, role, referralCode, totpCode } = payload;
 
     // ---- 1. Validate Stellar address format ----
@@ -221,7 +222,8 @@ export class AuthService {
     const tokens = await this.issueSessionedTokenPair(user, deviceMeta);
 
     this.logger.log(`User authenticated: ${stellarAddress} (${user.role})`);
-    return { ...tokens, user };
+    // Issue #234 — never return the TOTP secret or recovery-code hashes
+    return { ...tokens, user: toSafeUser(user) };
   }
 
   async refresh(refreshToken: string, deviceMeta?: DeviceMetadata): Promise<TokenPair> {
