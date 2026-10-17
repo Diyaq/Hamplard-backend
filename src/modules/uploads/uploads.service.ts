@@ -102,6 +102,50 @@ export class UploadsService {
   }
 
   // ----------------------------------------------------------
+  // SERVER-GENERATED FILES (certificate PDFs, etc.) — issue #245
+  // ----------------------------------------------------------
+
+  /**
+   * Persists a server-generated buffer under a deterministic filename.
+   * Defaults to private visibility — callers stream it back through an
+   * authorised endpoint via readStoredFile().
+   */
+  async saveBuffer(
+    buffer: Buffer,
+    subfolder: string,
+    filename: string,
+    visibility: CdnAssetVisibility = 'private',
+  ): Promise<UploadResult> {
+    this.ensureDir(path.join(this.uploadDir, subfolder));
+
+    const safeName = path.basename(filename);
+    const filePath = path.join(this.uploadDir, subfolder, safeName);
+
+    fs.writeFileSync(filePath, buffer);
+    this.logger.log(`Generated file saved: ${filePath}`);
+
+    const originUrl = `/uploads/${subfolder}/${safeName}`;
+    return this.toUploadResult(originUrl, visibility);
+  }
+
+  /**
+   * Reads a stored file by its origin path (e.g. /uploads/certificates/x.pdf).
+   * Returns null when the file does not exist; rejects paths that escape the
+   * upload directory.
+   */
+  readStoredFile(originPath: string): Buffer | null {
+    const root = path.resolve(this.uploadDir);
+    const relative = originPath.replace(/^\/?uploads\//, '');
+    const filePath = path.resolve(root, relative);
+
+    if (!filePath.startsWith(root + path.sep)) {
+      throw new BadRequestException('Invalid storage path');
+    }
+    if (!fs.existsSync(filePath)) return null;
+    return fs.readFileSync(filePath);
+  }
+
+  // ----------------------------------------------------------
   // VIDEO UPLOAD AND TRANSCODING
   // ----------------------------------------------------------
 

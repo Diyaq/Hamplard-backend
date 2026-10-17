@@ -6,7 +6,15 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ExamsService } from '../exams/exams.service';
-import { NotificationType } from '@prisma/client';
+import { NotificationType, UserRole } from '@prisma/client';
+import { UploadsService } from '../uploads/uploads.service';
+
+/** Authenticated caller requesting a certificate download. */
+export interface CertificateRequester {
+  id: string;
+  stellarAddress?: string | null;
+  role: UserRole;
+}
 import { CertificateRenderData } from './certificate-template.types';
 import { v4 as uuidv4 } from 'uuid';
 import { CertificatePdfService } from '../certificates/certificate-pdf.service';
@@ -21,6 +29,7 @@ export class CertificatesService {
     private readonly notifications: NotificationsService,
     private readonly examsService: ExamsService,
     private readonly pdfService: CertificatePdfService,
+    private readonly uploads: UploadsService,
   ) {}
 
   /**
@@ -89,8 +98,9 @@ export class CertificatesService {
       renderData,
     );
 
-    // Store PDF file reference (in production this would be uploaded to S3/cloud storage)
-    const pdfUrl = `certificates/${certificateId}.pdf`;
+    // Issue #245 — persist the PDF so it can actually be downloaded later.
+    const stored = await this.uploads.saveBuffer(pdfBuffer, 'certificates', `${certificateId}.pdf`);
+    const pdfUrl = stored.originUrl;
     const updatedCert = await this.prisma.certificate.update({
       where: { id: certificateId },
       data: { pdfUrl },
@@ -136,6 +146,46 @@ export class CertificatesService {
     });
     if (!cert) throw new NotFoundException('Certificate not found');
     return cert;
+  }
+
+  /**
+   * Issue #245 — returns the PDF bytes for the certificate holder or an ADMIN.
+   * Certificates issued before PDFs were persisted have no file on disk; they
+   * are re-rendered and stored on first download.
+   */
+  async getPdfForDownload(
+    certificateId: string,
+    user: CertificateRequester,
+  ): Promise<{ buffer: Buffer; filename: string }> {
+    const cert = await this.findById(certificateId);
+
+    const isAdmin = user.role === UserRole.ADMIN;
+    const isHolder =
+      cert.studentId === user.id ||
+      (!!user.stellarAddress && cert.student?.stellarAddress === user.stellarAddress);
+    if (!isAdmin && !isHolder) {
+      throw new ForbiddenException('Only the certificate holder or an admin can download this certificate');
+    }
+
+    let buffer = cert.pdfUrl ? this.uploads.readStoredFile(cert.pdfUrl) : null;
+
+    if (!buffer) {
+      buffer = await this.pdfService.renderForCategory(cert.course.category, {
+        studentName:   cert.student.name,
+        courseTitle:   cert.courseTitle,
+        certificateId: cert.id,
+        issuedAt:      cert.issuedAt,
+        category:      cert.course.category,
+      });
+      const stored = await this.uploads.saveBuffer(buffer, 'certificates', `${cert.id}.pdf`);
+      await this.prisma.certificate.update({
+        where: { id: cert.id },
+        data: { pdfUrl: stored.originUrl },
+      });
+      this.logger.log(`Re-generated missing PDF for certificate ${cert.id}`);
+    }
+
+    return { buffer, filename: `certificate-${cert.id}.pdf` };
   }
 
   /**

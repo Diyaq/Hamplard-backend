@@ -2,7 +2,7 @@ import {
   Controller, Get, Post, Body, Param, UseGuards, HttpCode, HttpStatus, Query,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import { AssignmentsService } from './assignments.service';
+import { AssignmentsService, AssignmentViewer } from './assignments.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../../common/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -10,6 +10,7 @@ import { UserRole } from '@prisma/client';
 import { CreateAssignmentDto } from './dto/create-assignment.dto';
 import { ReviewAssignmentDto } from './dto/review-assignment.dto';
 import { PendingSubmissionsQueryDto } from './dto/pending-submissions-query.dto';
+import { SubmitAssignmentDto } from './dto/submit-assignment.dto';
 
 @ApiTags('assignments')
 @ApiBearerAuth()
@@ -19,9 +20,16 @@ export class AssignmentsController {
   constructor(private readonly assignmentsService: AssignmentsService) {}
 
   @Get('lesson/:lessonId')
-  @ApiOperation({ summary: 'Get assignment for a lesson' })
-  findByLesson(@Param('lessonId') lessonId: string) {
-    return this.assignmentsService.findByLesson(lessonId);
+  @ApiOperation({
+    summary: 'Get assignment for a lesson',
+    description:
+      'Students receive only their own submission; the course instructor and admins receive all.',
+  })
+  findByLesson(
+    @Param('lessonId') lessonId: string,
+    @CurrentUser() user: AssignmentViewer,
+  ) {
+    return this.assignmentsService.findByLesson(lessonId, user);
   }
 
   @Post()
@@ -43,10 +51,10 @@ export class AssignmentsController {
   submit(
     @Param('id') assignmentId: string,
     @CurrentUser('id') studentId: string,
-    @Body() body: { submissionUrl: string; notes?: string },
+    @Body() dto: SubmitAssignmentDto,
   ) {
     return this.assignmentsService.submit(
-      studentId, assignmentId, body.submissionUrl, body.notes,
+      studentId, assignmentId, dto.submissionUrl, dto.notes,
     );
   }
 
