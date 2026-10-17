@@ -790,13 +790,13 @@ model ChainEvent {
 }
 
 /// Durable checkpoint for the Stellar event poller (EventsService).
-/// A single row (keyed by `key`) records the last Stellar ledger the poller
-/// finished processing so the service can resume from it after a restart or
-/// crash instead of replaying from the chain tip and missing events.
+/// A single row (keyed by `key`) records the next ledger to scan and, while
+/// processing a page, the exact last event processed within that range.
 model EventPollerCheckpoint {
   id                       String    @id @default(uuid())
   key                      String    @unique
   lastProcessedLedger      Int       @default(0)
+  lastProcessedCursor      String?
   lastPolledAt             DateTime?
   lastWriteError           String?
   consecutiveWriteFailures Int       @default(0)

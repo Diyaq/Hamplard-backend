@@ -11,6 +11,8 @@ import {
   xdr,
 } from '@stellar/stellar-sdk';
 
+export const CONTRACT_EVENT_PAGE_LIMIT = 100;
+
 /**
  * StellarService
  *
@@ -65,28 +67,25 @@ export class StellarService implements OnModuleInit {
   // EVENT FETCHING
   // ----------------------------------------------------------
 
-  /**
-   * Fetch Hamplard contract events from a given ledger.
-   * Called every 5 seconds by EventsService.
-   */
+  /** Fetch one page of Hamplard contract events. A cursor resumes after its event. */
   async fetchContractEvents(
     startLedger: number,
-  ): Promise<SorobanRpc.Api.EventResponse[]> {
+    cursor?: string,
+  ): Promise<SorobanRpc.Api.GetEventsResponse> {
     try {
-      const result = await this.rpcClient.getEvents({
-        startLedger,
+      return await this.rpcClient.getEvents({
+        ...(cursor ? { cursor } : { startLedger }),
         filters: [
           {
             type: 'contract',
             contractIds: [this.contractId],
           },
         ],
-        limit: 100,
+        limit: CONTRACT_EVENT_PAGE_LIMIT,
       });
-      return result.events ?? [];
     } catch (error) {
-      this.logger.error(`Failed to fetch events from ledger ${startLedger}`, error.message);
-      return [];
+      this.logger.error(`Failed to fetch events from ${cursor ? 'cursor' : `ledger ${startLedger}`}`, error.message);
+      throw error;
     }
   }
 
