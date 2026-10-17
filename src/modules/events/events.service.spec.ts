@@ -94,7 +94,7 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
   describe('pollEvents — checkpoint writes after each poll', () => {
     beforeEach(async () => {
       mockPrisma.eventPollerCheckpoint.findUnique.mockResolvedValue(null);
-      mockStellar.getLatestLedger.mockResolvedValue(100);
+      mockStellar.getLatestLedger.mockResolvedValue(108);
       await service.onModuleInit();
       jest.clearAllMocks();
       mockPrisma.eventPollerCheckpoint.upsert.mockResolvedValue({});
@@ -102,24 +102,27 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
     });
 
     it('advances and persists the ledger after processing events', async () => {
-      mockStellar.fetchContractEvents.mockResolvedValue([
-        { ledger: 105, topic: ['course_registered'], value: 'COURSE-1', txHash: 'a' },
-        { ledger: 107, topic: ['course_registered'], value: 'COURSE-2', txHash: 'b' },
-      ]);
+      mockStellar.fetchContractEvents.mockResolvedValue({
+        latestLedger: 108,
+        events: [
+          { ledger: 105, pagingToken: 'a', topic: ['course_registered'], value: 'COURSE-1', txHash: 'a' },
+          { ledger: 107, pagingToken: 'b', topic: ['course_registered'], value: 'COURSE-2', txHash: 'b' },
+        ],
+      });
 
       await service.pollEvents();
 
       expect(mockPrisma.eventPollerCheckpoint.upsert).toHaveBeenCalledWith(
         expect.objectContaining({
-          update: expect.objectContaining({ lastProcessedLedger: 108 }),
+          update: expect.objectContaining({ lastProcessedLedger: 109, lastProcessedCursor: null }),
         }),
       );
       const status = await service.getCheckpointStatus();
-      expect(status.lastProcessedLedger).toBe(108);
+      expect(status.lastProcessedLedger).toBe(109);
     });
 
     it('still writes a checkpoint when a poll finds no events', async () => {
-      mockStellar.fetchContractEvents.mockResolvedValue([]);
+      mockStellar.fetchContractEvents.mockResolvedValue({ latestLedger: 108, events: [] });
 
       await service.pollEvents();
 
@@ -127,26 +130,99 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
     });
   });
 
+  describe('pollEvents — cursor pagination (Issue #227)', () => {
+    const events = Array.from({ length: 101 }, (_, i) => ({
+      id: `event-${i}`,
+      ledger: 500,
+      pagingToken: `token-${i}`,
+      topic: ['course_registered'],
+      value: `COURSE-${i}`,
+      txHash: `tx-${i}`,
+    }));
+
+    beforeEach(async () => {
+      mockPrisma.eventPollerCheckpoint.findUnique.mockResolvedValue(null);
+      mockStellar.getLatestLedger.mockResolvedValue(500);
+      await service.onModuleInit();
+      jest.clearAllMocks();
+      mockPrisma.eventPollerCheckpoint.upsert.mockResolvedValue({});
+      mockPrisma.chainEvent.create.mockResolvedValue({});
+      mockStellar.getLatestLedger.mockResolvedValue(500);
+    });
+
+    it('processes all 101 events in one ledger across two pages', async () => {
+      mockStellar.fetchContractEvents
+        .mockResolvedValueOnce({ latestLedger: 500, events: events.slice(0, 100) })
+        .mockResolvedValueOnce({ latestLedger: 500, events: events.slice(100) });
+
+      await service.pollEvents();
+
+      expect(mockPrisma.chainEvent.create).toHaveBeenCalledTimes(101);
+      expect(mockStellar.fetchContractEvents).toHaveBeenNthCalledWith(1, 490, undefined);
+      expect(mockStellar.fetchContractEvents).toHaveBeenNthCalledWith(2, 501, 'token-99');
+      expect(mockPrisma.eventPollerCheckpoint.upsert).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({ lastProcessedLedger: 501, lastProcessedCursor: null }),
+        }),
+      );
+    });
+
+    it('resumes after the last processed event when the next page fails and the service restarts', async () => {
+      let checkpoint: any = null;
+      mockPrisma.eventPollerCheckpoint.upsert.mockImplementation(async ({ create, update }) => {
+        checkpoint = { ...create, ...update };
+        return checkpoint;
+      });
+      mockStellar.fetchContractEvents
+        .mockResolvedValueOnce({ latestLedger: 500, events: events.slice(0, 100) })
+        .mockRejectedValueOnce(new Error('RPC unavailable'));
+
+      await service.pollEvents();
+      expect(checkpoint.lastProcessedCursor).toBe('token-99');
+      expect(mockPrisma.chainEvent.create).toHaveBeenCalledTimes(100);
+
+      mockPrisma.eventPollerCheckpoint.findUnique.mockResolvedValue(checkpoint);
+      const restarted = new EventsService(
+        mockPrisma as any,
+        mockStellar as any,
+        mockNotifications as any,
+        mockCourses as any,
+      );
+      await restarted.onModuleInit();
+      mockStellar.fetchContractEvents.mockReset().mockResolvedValue({
+        latestLedger: 500,
+        events: events.slice(100),
+      });
+
+      await restarted.pollEvents();
+
+      expect(mockStellar.fetchContractEvents).toHaveBeenCalledWith(501, 'token-99');
+      expect(mockPrisma.chainEvent.create).toHaveBeenCalledTimes(101);
+      expect(checkpoint.lastProcessedCursor).toBeNull();
+    });
+  });
+
   describe('pollEvents — checkpoint write failures do not block polling', () => {
     beforeEach(async () => {
       mockPrisma.eventPollerCheckpoint.findUnique.mockResolvedValue(null);
-      mockStellar.getLatestLedger.mockResolvedValue(100);
+      mockStellar.getLatestLedger.mockResolvedValue(110);
       await service.onModuleInit();
       jest.clearAllMocks();
       mockPrisma.chainEvent.create.mockResolvedValue({});
     });
 
     it('swallows the write error, records the failure and keeps advancing in memory', async () => {
-      mockStellar.fetchContractEvents.mockResolvedValue([
-        { ledger: 110, topic: ['course_registered'], value: 'COURSE-1', txHash: 'a' },
-      ]);
+      mockStellar.fetchContractEvents.mockResolvedValue({
+        latestLedger: 110,
+        events: [{ ledger: 110, pagingToken: 'a', topic: ['course_registered'], value: 'COURSE-1', txHash: 'a' }],
+      });
       mockPrisma.eventPollerCheckpoint.upsert.mockRejectedValue(new Error('db down'));
       mockPrisma.eventPollerCheckpoint.updateMany.mockResolvedValue({ count: 1 });
 
       await expect(service.pollEvents()).resolves.not.toThrow();
 
       const status = await service.getCheckpointStatus();
-      expect(status.consecutiveWriteFailures).toBe(1);
+      expect(status.consecutiveWriteFailures).toBe(2);
       expect(status.lastWriteError).toContain('db down');
       expect(status.healthy).toBe(false);
       // in-memory progress is not lost
@@ -154,7 +230,7 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
     });
 
     it('recovers (failure counter resets) once a later write succeeds', async () => {
-      mockStellar.fetchContractEvents.mockResolvedValue([]);
+      mockStellar.fetchContractEvents.mockResolvedValue({ latestLedger: 110, events: [] });
       mockPrisma.eventPollerCheckpoint.upsert
         .mockRejectedValueOnce(new Error('transient'))
         .mockResolvedValueOnce({});
