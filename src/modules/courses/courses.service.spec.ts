@@ -346,3 +346,100 @@ describe('CoursesService', () => {
     });
   });
 });
+
+// ----------------------------------------------------------
+// STATUS TRANSITIONS — search index + cache sync (issue #232)
+// ----------------------------------------------------------
+
+describe('CoursesService status transitions (issue #232)', () => {
+  let service: CoursesService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new CoursesService(
+      mockPrisma as any,
+      mockNotifications as any,
+      {} as any,
+      mockSearchService as any,
+      mockCache as any,
+    );
+  });
+
+  const expectCachesInvalidated = () => {
+    expect(mockCache.invalidateNamespace).toHaveBeenCalledWith('courses:list');
+    expect(mockCache.invalidateNamespace).toHaveBeenCalledWith('courses:categories');
+  };
+
+  describe('approveCourse()', () => {
+    it('sets ACTIVE, indexes the course in Meilisearch and invalidates caches', async () => {
+      mockPrisma.course.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.course.findUnique.mockResolvedValue({
+        ...MOCK_COURSE,
+        description: 'Learn tailoring',
+        language: 'English',
+        avgRating: 0,
+        totalReviews: 0,
+        thumbnailUrl: null,
+        instructor: { name: 'John' },
+      });
+
+      await expect(service.approveCourse(MOCK_COURSE.id)).resolves.toBe(true);
+
+      expect(mockPrisma.course.updateMany).toHaveBeenCalledWith({
+        where: { id: MOCK_COURSE.id },
+        data: expect.objectContaining({ status: CourseStatus.ACTIVE, approvedAt: expect.any(Date) }),
+      });
+      expect(mockSearchService.indexCourse).toHaveBeenCalledWith(
+        expect.objectContaining({ id: MOCK_COURSE.id, status: CourseStatus.ACTIVE }),
+      );
+      expect(mockSearchService.removeCourse).not.toHaveBeenCalled();
+      expectCachesInvalidated();
+    });
+
+    it('returns false and touches neither search nor cache when the course is unknown', async () => {
+      mockPrisma.course.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.approveCourse('MISSING')).resolves.toBe(false);
+
+      expect(mockSearchService.indexCourse).not.toHaveBeenCalled();
+      expect(mockCache.invalidateNamespace).not.toHaveBeenCalled();
+    });
+  });
+
+  describe.each([
+    ['pauseCourse', CourseStatus.PAUSED],
+    ['archiveCourse', CourseStatus.ARCHIVED],
+  ] as const)('%s()', (method, status) => {
+    it(`sets ${status}, removes the course from Meilisearch and invalidates caches`, async () => {
+      mockPrisma.course.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(service[method](MOCK_COURSE.id)).resolves.toBe(true);
+
+      expect(mockPrisma.course.updateMany).toHaveBeenCalledWith({
+        where: { id: MOCK_COURSE.id },
+        data: { status },
+      });
+      expect(mockSearchService.removeCourse).toHaveBeenCalledWith(MOCK_COURSE.id);
+      expect(mockSearchService.indexCourse).not.toHaveBeenCalled();
+      expectCachesInvalidated();
+    });
+
+    it('still invalidates caches when the search engine is unavailable', async () => {
+      mockPrisma.course.updateMany.mockResolvedValue({ count: 1 });
+      mockSearchService.removeCourse.mockRejectedValueOnce(new Error('meilisearch down'));
+
+      await expect(service[method](MOCK_COURSE.id)).resolves.toBe(true);
+
+      expectCachesInvalidated();
+    });
+
+    it('returns false and touches neither search nor cache when the course is unknown', async () => {
+      mockPrisma.course.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service[method]('MISSING')).resolves.toBe(false);
+
+      expect(mockSearchService.removeCourse).not.toHaveBeenCalled();
+      expect(mockCache.invalidateNamespace).not.toHaveBeenCalled();
+    });
+  });
+});

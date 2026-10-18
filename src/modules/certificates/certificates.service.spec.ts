@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { CertificatesService } from './certificates.service';
+import { CertificatesService, PUBLIC_CERTIFICATE_SELECT } from './certificates.service';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -309,6 +309,85 @@ describe('CertificatesService', () => {
       await expect(
         service.getPdfForDownload('MISSING', { id: 'admin-1', role: UserRole.ADMIN }),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('public lookups hide admin PII (issue #246)', () => {
+    const PUBLIC_ROW = {
+      id: 'CERT-REVOKED',
+      courseId: 'COURSE-TAILORING-001',
+      courseTitle: 'Professional Tailoring',
+      instructorAddress: 'GXYZ',
+      txHash: 'tx-1',
+      isRevoked: true,
+      revokedAt: new Date('2026-02-01T00:00:00Z'),
+      issuedAt: new Date('2026-01-01T00:00:00Z'),
+      student: { name: 'Jane', stellarAddress: 'GABC' },
+      course: {
+        id: 'COURSE-TAILORING-001',
+        title: 'Professional Tailoring',
+        category: 'Tailoring',
+        level: 'Beginner',
+        thumbnailUrl: null,
+        instructor: { name: 'John', stellarAddress: 'GXYZ' },
+      },
+    };
+
+    it('the public projection never selects revokedBy, revokedById or the admin email', () => {
+      expect(PUBLIC_CERTIFICATE_SELECT).not.toHaveProperty('revokedBy');
+      expect(PUBLIC_CERTIFICATE_SELECT).not.toHaveProperty('revokedById');
+      expect(PUBLIC_CERTIFICATE_SELECT).not.toHaveProperty('studentId');
+      expect(JSON.stringify(PUBLIC_CERTIFICATE_SELECT)).not.toContain('email');
+    });
+
+    it('findPublicById() queries with the public projection and exposes only isRevoked', async () => {
+      mockPrisma.certificate.findUnique.mockResolvedValue(PUBLIC_ROW);
+
+      const cert = await service.findPublicById('CERT-REVOKED');
+
+      expect(mockPrisma.certificate.findUnique).toHaveBeenCalledWith({
+        where: { id: 'CERT-REVOKED' },
+        select: PUBLIC_CERTIFICATE_SELECT,
+      });
+      expect(cert.isRevoked).toBe(true);
+      expect(cert).not.toHaveProperty('revokedBy');
+      expect(cert).not.toHaveProperty('revokedById');
+    });
+
+    it('findPublicById() throws NotFoundException for an unknown certificate', async () => {
+      mockPrisma.certificate.findUnique.mockResolvedValue(null);
+      await expect(service.findPublicById('MISSING')).rejects.toThrow(NotFoundException);
+    });
+
+    it('verify() uses the public projection, so revokedBy.email / revokedBy.id never load', async () => {
+      mockPrisma.certificate.findUnique.mockResolvedValue({ ...PUBLIC_ROW, isRevoked: false });
+      mockStellar.verifyCertificateOnChain.mockResolvedValue(true);
+
+      const result = await service.verify('CERT-REVOKED');
+
+      const query = mockPrisma.certificate.findUnique.mock.calls[0][0];
+      expect(query.select).toBe(PUBLIC_CERTIFICATE_SELECT);
+      expect(query).not.toHaveProperty('include');
+      expect(result.valid).toBe(true);
+      expect(result.certificate).not.toHaveProperty('revokedBy');
+      expect(JSON.stringify(result)).not.toContain('email');
+    });
+
+    it('findById() (admin/internal) still loads revokedBy details', async () => {
+      mockPrisma.certificate.findUnique.mockResolvedValue({
+        ...PUBLIC_ROW,
+        revokedBy: { id: 'admin-1', name: 'Admin', email: 'admin@hamplard.io' },
+      });
+
+      await service.findById('CERT-REVOKED');
+
+      expect(mockPrisma.certificate.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: expect.objectContaining({
+            revokedBy: { select: { id: true, name: true, email: true } },
+          }),
+        }),
+      );
     });
   });
 });

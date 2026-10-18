@@ -144,6 +144,34 @@ describe('GoogleAuthService', () => {
     expect(prisma.user.create).not.toHaveBeenCalled();
   });
 
+  it('never returns the TOTP secret or recovery-code hashes in the login payload (issue #234)', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({
+      id: 'user-2fa',
+      email: identity.email,
+      googleId: identity.googleId,
+      name: identity.name,
+      avatarUrl: identity.avatarUrl,
+    });
+    prisma.user.update.mockResolvedValue({
+      id: 'user-2fa',
+      stellarAddress: null,
+      googleId: identity.googleId,
+      email: identity.email,
+      role: 'STUDENT',
+      twoFactorEnabled: true,
+      twoFactorSecret: 'JBSWY3DPEHPK3PXP',
+      twoFactorRecoveryCodes: ['$2b$10$hash1'],
+    });
+    const service = buildService();
+
+    const result = await service.login(identity);
+
+    expect(result.user).not.toHaveProperty('twoFactorSecret');
+    expect(result.user).not.toHaveProperty('twoFactorRecoveryCodes');
+    expect(result.user).toMatchObject({ id: 'user-2fa', twoFactorEnabled: true });
+    expect(JSON.stringify(result)).not.toContain('JBSWY3DPEHPK3PXP');
+  });
+
   describe('when Google credentials are configured', () => {
     it('is enabled and does not throw from assertEnabled', () => {
       const service = buildService();

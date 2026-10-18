@@ -350,6 +350,163 @@ export class CoursesService {
     await this.searchService.indexCourse(doc);
   }
 
+  async updateStats(courseId: string, delta: { enrollments?: number; revenue?: number }) {
+    const course = await this.findOne(courseId);
+    return this.prisma.course.update({
+      where: { id: courseId },
+      data: {
+        totalEnrollments: { increment: delta.enrollments ?? 0 },
+        totalRevenue:     { increment: delta.revenue ?? 0 },
+      },
+    });
+  }
+
+  // ----------------------------------------------------------
+  // STATUS TRANSITIONS (issue #232)
+  // ----------------------------------------------------------
+  // Used by on-chain event sync and auto-moderation. Each transition keeps
+  // the Meilisearch index and the Redis course-list caches in step with the
+  // DB status: only ACTIVE courses are indexed.
+
+  /** Marks a course ACTIVE, indexes it for search and purges list caches. */
+  async approveCourse(courseId: string): Promise<boolean> {
+    const { count } = await this.prisma.course.updateMany({
+      where: { id: courseId },
+      data: { status: CourseStatus.ACTIVE, approvedAt: new Date() },
+    });
+    if (!count) {
+      this.logger.warn(`approveCourse: course ${courseId} not found`);
+      return false;
+    }
+
+    await this.indexCourseForSearch(courseId);
+    await this.invalidateCourseCaches();
+    this.logger.log(`Course ${courseId} → ACTIVE (indexed for search)`);
+    return true;
+  }
+
+  /** Marks a course PAUSED, removes it from search and purges list caches. */
+  async pauseCourse(courseId: string): Promise<boolean> {
+    return this.delistCourse(courseId, CourseStatus.PAUSED);
+  }
+
+  /** Marks a course ARCHIVED, removes it from search and purges list caches. */
+  async archiveCourse(courseId: string): Promise<boolean> {
+    return this.delistCourse(courseId, CourseStatus.ARCHIVED);
+  }
+
+  private async delistCourse(courseId: string, status: CourseStatus): Promise<boolean> {
+    const { count } = await this.prisma.course.updateMany({
+      where: { id: courseId },
+      data: { status },
+    });
+    if (!count) {
+      this.logger.warn(`Cannot set course ${courseId} to ${status}: not found`);
+      return false;
+    }
+
+    await this.removeCourseFromSearch(courseId);
+    await this.invalidateCourseCaches();
+    this.logger.log(`Course ${courseId} → ${status} (removed from search)`);
+    return true;
+  }
+
+  // ----------------------------------------------------------
+  // SEARCH INDEX HELPERS
+  // ----------------------------------------------------------
+
+  /** Removes a course from the search index; failures are logged, not thrown. */
+  private async removeCourseFromSearch(courseId: string): Promise<void> {
+    try {
+      await this.searchService.removeCourse(courseId);
+    } catch (err) {
+      this.logger.error(
+        `Failed to remove course ${courseId} from search index: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Builds a search document from the course in the database and
+   * syncs it to the Meilisearch index.
+   */
+  private async indexCourseForSearch(courseId: string): Promise<void> {
+    try {
+      const course = await this.prisma.course.findUnique({
+        where: { id: courseId },
+        include: {
+          instructor: { select: { name: true } },
+        },
+      });
+
+      if (!course) {
+        this.logger.warn(`Cannot index course ${courseId}: not found`);
+        return;
+      }
+
+      const doc: CourseSearchDocument = {
+        id: course.id,
+        title: course.title,
+        description: course.description ?? '',
+        category: course.category,
+        level: course.level,
+        language: course.language,
+        instructorAddress: course.instructorAddress,
+        instructorName: course.instructor?.name ?? '',
+        price: Number(course.price),
+        avgRating: course.avgRating,
+        totalEnrollments: course.totalEnrollments,
+        totalReviews: course.totalReviews,
+        thumbnailUrl: course.thumbnailUrl ?? '',
+        status: course.status,
+        lastIndexedAt: 0, // will be set by searchService.indexCourse
+      };
+
+      await this.searchService.indexCourse(doc);
+    } catch (err) {
+      this.logger.error(
+        `Failed to index course ${courseId} for search: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // ----------------------------------------------------------
+  // COURSE PREREQUISITES (issue #24)
+  // ----------------------------------------------------------
+
+  /**
+   * Lists the prerequisites configured for a course — public read used by
+   * the catalog and by the enrollment pre-check feedback endpoint.
+   */
+  async getPrerequisites(courseId: string) {
+    await this.findOne(courseId);
+    const rows = await this.prisma.coursePrerequisite.findMany({
+      where: { courseId },
+      orderBy: { prerequisiteId: 'asc' },
+      include: {
+        prerequisite: {
+          select: {
+            id: true, title: true, category: true, level: true,
+            thumbnailUrl: true, status: true, totalLessons: true,
+          },
+        },
+      },
+    });
+    return rows.map((r) => r.prerequisite);
+  }
+
+  /**
+   * Replaces the full prerequisite list of a course (PUT semantics).
+   * Guards against self-reference, unknown IDs and cycles so that multiple
+   * chains can coexist while the overall graph stays acyclic.
+   */
+  async setPrerequisites(courseId: string, dto: SetPrerequisitesDto) {
+    await this.findOne(courseId);
+
+    const uniqueIds = [...new Set(dto.prerequisiteIds)];
+    if (uniqueIds.includes(courseId)) {
+      throw new ConflictException('A course cannot be its own prerequisite');
+    }
   async setPrerequisites(courseId: string, instructorId: string, dto: SetPrerequisitesDto) {
     const course = await this.prisma.course.findUnique({ where: { id: courseId } });
     if (!course) throw new NotFoundException(`Course ${courseId} not found`);

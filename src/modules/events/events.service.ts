@@ -358,12 +358,10 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     const courseId = String(payload);
     this.logger.log(`Course approved on-chain: ${courseId}`);
     // Sync status — safety net for cases where admin called approve_course
-    // on-chain without going through the backend endpoint
+    // on-chain without going through the backend endpoint. Issue #232: the
+    // transition also indexes the course for search and purges list caches.
     try {
-      await this.prisma.course.update({
-        where: { id: courseId },
-        data: { status: 'ACTIVE', approvedAt: new Date() },
-      });
+      await this.courses.approveCourse(courseId);
     } catch (e) {
       this.logger.warn(`Could not sync course approval for ${courseId}: ${e.message}`);
     }
@@ -371,18 +369,14 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
 
   private async handleCoursePaused(payload: any) {
     const courseId = String(payload);
-    await this.prisma.course.updateMany({
-      where: { id: courseId },
-      data: { status: 'PAUSED' },
-    });
+    this.logger.log(`Course paused on-chain: ${courseId}`);
+    await this.courses.pauseCourse(courseId);
   }
 
   private async handleCourseArchived(payload: any) {
     const courseId = String(payload);
-    await this.prisma.course.updateMany({
-      where: { id: courseId },
-      data: { status: 'ARCHIVED' },
-    });
+    this.logger.log(`Course archived on-chain: ${courseId}`);
+    await this.courses.archiveCourse(courseId);
   }
 
   private async handleStudentEnrolled(payload: any) {

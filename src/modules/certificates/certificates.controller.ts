@@ -29,9 +29,9 @@ export class CertificatesController {
   }
 
   @Get(':id')
-  @ApiOperation({ summary: 'Get full certificate details by ID (public)' })
+  @ApiOperation({ summary: 'Get public certificate details by ID (public, no admin PII)' })
   findOne(@Param('id') id: string) {
-    return this.certificatesService.findById(id);
+    return this.certificatesService.findPublicById(id);
   }
 
   /** Protected routes below */
@@ -55,6 +55,15 @@ export class CertificatesController {
     @Body() dto: IssueCertificateDto,
   ) {
     return this.certificatesService.issue(adminId, dto.studentId, dto.courseId);
+  }
+
+  @Get(':id/admin')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: '[Admin] Get full certificate details including revocation audit info' })
+  findOneForAdmin(@Param('id') id: string) {
+    return this.certificatesService.findById(id);
   }
 
   @Patch(':id/tx-hash')

@@ -3,10 +3,17 @@ import { Injectable, NotFoundException, BadRequestException, ForbiddenException,
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditAction, AuditTargetType } from '@prisma/client';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { PUBLIC_USER_SELECT, PublicUserDto } from './dto/public-user.dto';
+import { SafeUser, toSafeUser } from './user-serializer';
 
 @Injectable()
 export class UsersService {
   constructor(private readonly prisma: PrismaService) { }
+
+  /** Issue #234 — strips the TOTP secret and recovery-code hashes from a user record. */
+  toSafeUser<T extends Parameters<typeof toSafeUser>[0]>(user: T): SafeUser<T> {
+    return toSafeUser(user);
+  }
 
   async findById(id: string) {
     const user = await this.prisma.user.findUnique({
@@ -18,13 +25,20 @@ export class UsersService {
       },
     });
     if (!user) throw new NotFoundException('User not found');
-    return user;
+    return toSafeUser(user);
   }
 
-  async findByAddress(stellarAddress: string) {
-    const user = await this.prisma.user.findUnique({ where: { stellarAddress } });
+  /**
+   * Issue #233 — public profile lookup. Uses an explicit whitelist projection
+   * so contact details, 2FA secrets and moderation fields are never loaded.
+   */
+  async getPublicProfile(stellarAddress: string): Promise<PublicUserDto> {
+    const user = await this.prisma.user.findUnique({
+      where: { stellarAddress },
+      select: PUBLIC_USER_SELECT,
+    });
     if (!user) throw new NotFoundException('User not found');
-    return user;
+    return PublicUserDto.fromRecord(user);
   }
 
   async updateProfile(
@@ -32,7 +46,7 @@ export class UsersService {
     data: UpdateProfileDto,
   ) {
     try {
-      return await this.prisma.user.update({ where: { id }, data });
+      return toSafeUser(await this.prisma.user.update({ where: { id }, data }));
     } catch (error: any) {
       if (error?.code === 'P2002') {
         throw new ConflictException('An account with this email address already exists');
@@ -109,7 +123,7 @@ export class UsersService {
       },
     });
 
-    return updatedUser;
+    return toSafeUser(updatedUser);
   }
 
   /**
@@ -160,7 +174,7 @@ export class UsersService {
       },
     });
 
-    return updatedUser;
+    return toSafeUser(updatedUser);
   }
 
   /**
@@ -232,7 +246,7 @@ export class UsersService {
       },
     });
 
-    return updatedUser;
+    return toSafeUser(updatedUser);
   }
 
   /**
@@ -285,7 +299,7 @@ export class UsersService {
       },
     });
 
-    return updatedUser;
+    return toSafeUser(updatedUser);
   }
 
   /**

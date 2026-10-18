@@ -6,8 +6,40 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ExamsService } from '../exams/exams.service';
-import { NotificationType, UserRole } from '@prisma/client';
+import { NotificationType, Prisma, UserRole } from '@prisma/client';
 import { UploadsService } from '../uploads/uploads.service';
+
+/**
+ * Issue #246 — projection for the unauthenticated certificate endpoints.
+ * Revocation is exposed only as status flags; the revoking admin's identity
+ * (`revokedBy` / `revokedById`), internal user ids and the stored PDF path
+ * are never selected.
+ */
+export const PUBLIC_CERTIFICATE_SELECT = {
+  id: true,
+  courseId: true,
+  courseTitle: true,
+  instructorAddress: true,
+  txHash: true,
+  isRevoked: true,
+  revokedAt: true,
+  issuedAt: true,
+  student: { select: { name: true, stellarAddress: true } },
+  course: {
+    select: {
+      id: true,
+      title: true,
+      category: true,
+      level: true,
+      thumbnailUrl: true,
+      instructor: { select: { name: true, stellarAddress: true } },
+    },
+  },
+} satisfies Prisma.CertificateSelect;
+
+export type PublicCertificate = Prisma.CertificateGetPayload<{
+  select: typeof PUBLIC_CERTIFICATE_SELECT;
+}>;
 
 /** Authenticated caller requesting a certificate download. */
 export interface CertificateRequester {
@@ -135,6 +167,10 @@ export class CertificatesService {
     });
   }
 
+  /**
+   * Full certificate record including the revoking admin. Internal use and
+   * admin-only routes — public endpoints must use `findPublicById` (#246).
+   */
   async findById(certificateId: string) {
     const cert = await this.prisma.certificate.findUnique({
       where: { id: certificateId },
@@ -143,6 +179,16 @@ export class CertificatesService {
         course:  { include: { instructor: { select: { name: true, stellarAddress: true } } } },
         revokedBy: { select: { id: true, name: true, email: true } },
       },
+    });
+    if (!cert) throw new NotFoundException('Certificate not found');
+    return cert;
+  }
+
+  /** Issue #246 — public certificate lookup without admin PII. */
+  async findPublicById(certificateId: string): Promise<PublicCertificate> {
+    const cert = await this.prisma.certificate.findUnique({
+      where: { id: certificateId },
+      select: PUBLIC_CERTIFICATE_SELECT,
     });
     if (!cert) throw new NotFoundException('Certificate not found');
     return cert;
@@ -193,7 +239,7 @@ export class CertificatesService {
    * Returns the certificate details if valid, or an error if revoked/not found.
    */
   async verify(certificateId: string) {
-    const cert = await this.findById(certificateId);
+    const cert = await this.findPublicById(certificateId);
 
     if (cert.isRevoked) {
       return { valid: false, reason: 'Certificate has been revoked', certificate: null };

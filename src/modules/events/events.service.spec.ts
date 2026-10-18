@@ -367,11 +367,13 @@ describe('EventsService — poller scheduling & re-entrancy (Issue #229)', () =>
     getLatestLedger: jest.fn().mockResolvedValue(100),
     fetchContractEvents: jest.fn(),
   };
+  const mockCourses = { pauseCourse: jest.fn() };
 
   beforeEach(async () => {
     scheduler = buildMockScheduler();
     config.get.mockReset();
     mockStellar.fetchContractEvents.mockReset();
+    mockCourses.pauseCourse.mockReset();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -379,7 +381,7 @@ describe('EventsService — poller scheduling & re-entrancy (Issue #229)', () =>
         { provide: PrismaService, useValue: mockPrisma },
         { provide: StellarService, useValue: mockStellar },
         { provide: NotificationsService, useValue: { notifyUser: jest.fn() } },
-        { provide: CoursesService, useValue: {} },
+        { provide: CoursesService, useValue: mockCourses },
         { provide: ConfigService, useValue: config },
         { provide: SchedulerRegistry, useValue: scheduler },
       ],
@@ -459,13 +461,64 @@ describe('EventsService — poller scheduling & re-entrancy (Issue #229)', () =>
     mockStellar.fetchContractEvents
       .mockResolvedValueOnce([{ ledger: 101, topic: ['course_paused'], value: 'C-1' }])
       .mockResolvedValueOnce([]);
-    (mockPrisma as any).course = {
-      updateMany: jest.fn().mockRejectedValue(new Error('db write failed')),
-    };
+    mockCourses.pauseCourse.mockRejectedValue(new Error('db write failed'));
 
     await service.pollEvents();
     await service.pollEvents();
 
     expect(mockStellar.fetchContractEvents).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('EventsService — course status sync via CoursesService (Issue #232)', () => {
+  let service: EventsService;
+
+  const mockPrisma = {
+    chainEvent: { create: jest.fn().mockResolvedValue({}) },
+    course: { update: jest.fn(), updateMany: jest.fn() },
+  };
+  const mockCourses = {
+    approveCourse: jest.fn().mockResolvedValue(true),
+    pauseCourse: jest.fn().mockResolvedValue(true),
+    archiveCourse: jest.fn().mockResolvedValue(true),
+  };
+
+  const emit = (eventName: string, courseId: string) =>
+    (service as any).processEvent({ ledger: 101, topic: [eventName], value: courseId });
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        EventsService,
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: StellarService, useValue: { getLatestLedger: jest.fn(), fetchContractEvents: jest.fn() } },
+        { provide: NotificationsService, useValue: { notifyUser: jest.fn() } },
+        { provide: CoursesService, useValue: mockCourses },
+        { provide: ConfigService, useValue: { get: jest.fn() } },
+        { provide: SchedulerRegistry, useValue: buildMockScheduler() },
+      ],
+    }).compile();
+
+    service = module.get(EventsService);
+    jest.clearAllMocks();
+  });
+
+  it.each([
+    ['course_approved', 'approveCourse'],
+    ['course_paused', 'pauseCourse'],
+    ['course_archived', 'archiveCourse'],
+  ] as const)('%s delegates to CoursesService.%s', async (eventName, method) => {
+    await emit(eventName, 'C-1');
+
+    expect(mockCourses[method]).toHaveBeenCalledWith('C-1');
+    // Status writes go through CoursesService so search + cache stay in sync
+    expect(mockPrisma.course.update).not.toHaveBeenCalled();
+    expect(mockPrisma.course.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('course_approved swallows sync failures so polling continues', async () => {
+    mockCourses.approveCourse.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(emit('course_approved', 'C-1')).resolves.toBeUndefined();
   });
 });
