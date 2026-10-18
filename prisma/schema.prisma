@@ -484,6 +484,7 @@ model Lesson {
   type         LessonType  @default(VIDEO)
   videoUrl     String?     // URL to video file (S3 / local)
   videoDuration Int?       // seconds
+  quizDurationMinutes Int  @default(15)
   thumbnailUrl String?     // URL to auto-generated or manually set thumbnail
   content      String?     // for TEXT type lessons
   resourceUrl  String?     // downloadable resource

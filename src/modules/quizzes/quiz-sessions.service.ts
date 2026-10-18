@@ -9,7 +9,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { QuizSessionStatus } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { QuizAttemptsService, QuizAttemptResult } from './quiz-attempts.service';
-import { StartQuizSessionDto, SubmitSessionAnswersDto } from './dto/quiz-sessions.dto';
+import { SubmitSessionAnswersDto } from './dto/quiz-sessions.dto';
 
 export { QuizSessionStatus };
 
@@ -55,7 +55,6 @@ export class QuizSessionsService {
   async startSession(
     lessonId: string,
     userId: string,
-    dto: StartQuizSessionDto,
   ): Promise<QuizSessionStatusResponse> {
     const lesson = await this.prisma.lesson.findUnique({
       where: { id: lessonId },
@@ -73,7 +72,7 @@ export class QuizSessionsService {
       throw new BadRequestException('This lesson has no quiz questions in the bank');
     }
 
-    const durationMinutes = dto?.durationMinutes ?? 15;
+    const durationMinutes = lesson.quizDurationMinutes;
     const durationSeconds = durationMinutes * 60;
     const startTime = new Date();
     const expiresAt = new Date(startTime.getTime() + durationSeconds * 1000);
@@ -150,25 +149,23 @@ export class QuizSessionsService {
   /**
    * Auto-submits a quiz session on timeout.
    */
-  async autoSubmitSession(
+  private async autoSubmitSession(
     sessionId: string,
     userId: string,
-    dto?: SubmitSessionAnswersDto,
   ): Promise<QuizSessionStatusResponse> {
     const session = await this.loadOwnedSession(sessionId, userId);
 
-    if (session.status === QuizSessionStatus.COMPLETED) {
+    if (
+      session.status !== QuizSessionStatus.IN_PROGRESS ||
+      new Date() < session.expiresAt
+    ) {
       return this.buildStatusResponse(session);
     }
-
-    const answers = dto?.answers ?? [];
-    const passThreshold = dto?.passThreshold ?? 70;
 
     const result = await this.quizAttemptsService.submitQuizAttempt(
       session.lessonId,
       {
-        answers,
-        passThreshold,
+        answers: [],
       },
       userId,
     );

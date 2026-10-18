@@ -88,6 +88,7 @@ export class LessonsService {
       type?: string;
       videoUrl?: string;
       videoDuration?: number;
+      quizDurationMinutes?: number;
       thumbnailUrl?: string;
       content?: string;
       resourceUrl?: string;
@@ -106,6 +107,7 @@ export class LessonsService {
         type:          data.type as any ?? 'VIDEO',
         videoUrl:      data.videoUrl,
         videoDuration: data.videoDuration,
+        quizDurationMinutes: data.quizDurationMinutes,
         thumbnailUrl:  data.thumbnailUrl,
         content:       data.content,
         resourceUrl:   data.resourceUrl,

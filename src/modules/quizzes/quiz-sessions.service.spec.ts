@@ -41,7 +41,10 @@ describe('QuizSessionsService', () => {
     idSeq = 0;
     jest.clearAllMocks();
 
-    mockPrisma.lesson.findUnique.mockResolvedValue({ id: 'lesson-1' });
+    mockPrisma.lesson.findUnique.mockResolvedValue({
+      id: 'lesson-1',
+      quizDurationMinutes: 15,
+    });
     mockPrisma.quizQuestion.count.mockResolvedValue(3);
 
     mockPrisma.quizSession.create.mockImplementation(async ({ data }: any) => {
@@ -97,9 +100,7 @@ describe('QuizSessionsService', () => {
   });
 
   it('persists a started session so another instance can read it', async () => {
-    const started = await service.startSession('lesson-1', 'user-1', {
-      durationMinutes: 15,
-    });
+    const started = await service.startSession('lesson-1', 'user-1');
 
     expect(mockPrisma.quizSession.create).toHaveBeenCalled();
     expect(started.status).toBe(QuizSessionStatus.IN_PROGRESS);
@@ -114,9 +115,7 @@ describe('QuizSessionsService', () => {
   });
 
   it('lets another instance submit a session started elsewhere', async () => {
-    const started = await service.startSession('lesson-1', 'user-1', {
-      durationMinutes: 15,
-    });
+    const started = await service.startSession('lesson-1', 'user-1');
 
     const restarted = await buildModule();
     const service2 = restarted.get<QuizSessionsService>(QuizSessionsService);
@@ -131,9 +130,7 @@ describe('QuizSessionsService', () => {
   });
 
   it('expiration sweep queries expired IN_PROGRESS sessions from storage', async () => {
-    const started = await service.startSession('lesson-1', 'user-1', {
-      durationMinutes: 15,
-    });
+    const started = await service.startSession('lesson-1', 'user-1');
 
     // Force expiry in storage, as if time had passed.
     store.get(started.sessionId).expiresAt = new Date(Date.now() - 1000);
@@ -149,5 +146,43 @@ describe('QuizSessionsService', () => {
     });
     expect(store.get(started.sessionId).status).toBe(QuizSessionStatus.EXPIRED);
     expect(store.get(started.sessionId).autoSubmitted).toBe(true);
+  });
+
+  it('uses the instructor-configured duration instead of a student-supplied duration', async () => {
+    mockPrisma.lesson.findUnique.mockResolvedValue({
+      id: 'lesson-1',
+      quizDurationMinutes: 45,
+    });
+
+    const started = await service.startSession('lesson-1', 'user-1');
+
+    expect(started.durationSeconds).toBe(45 * 60);
+    expect(mockPrisma.quizSession.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ durationSeconds: 45 * 60 }),
+      }),
+    );
+  });
+
+  it('does not grade sessions that are already expired', async () => {
+    const started = await service.startSession('lesson-1', 'user-1');
+    const session = store.get(started.sessionId);
+    session.status = QuizSessionStatus.EXPIRED;
+    session.expiresAt = new Date(Date.now() - 1000);
+
+    await service.handleAutoSubmitOnTimeout();
+
+    expect(mockQuizAttempts.submitQuizAttempt).not.toHaveBeenCalled();
+  });
+
+  it('rejects answer submissions once the session has expired', async () => {
+    const started = await service.startSession('lesson-1', 'user-1');
+    store.get(started.sessionId).expiresAt = new Date(Date.now() - 1000);
+
+    await expect(
+      service.submitSession(started.sessionId, 'user-1', { answers: [] }),
+    ).rejects.toThrow('Quiz session has expired');
+
+    expect(mockQuizAttempts.submitQuizAttempt).not.toHaveBeenCalled();
   });
 });

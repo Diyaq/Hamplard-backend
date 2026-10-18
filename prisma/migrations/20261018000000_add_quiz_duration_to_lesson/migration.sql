@@ -1,0 +1,2 @@
+ALTER TABLE "lessons"
+ADD COLUMN "quizDurationMinutes" INTEGER NOT NULL DEFAULT 15;
