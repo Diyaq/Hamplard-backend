@@ -41,8 +41,5 @@ export class CreateCourseDto {
   @ApiProperty({ example: 50, description: 'Price in USDC' })
   @IsNumber() @Min(0)
   price: number;
-
-  @ApiProperty({ required: false, example: 20 })
-  @IsOptional() @IsInt() @Min(0) @Max(100)
-  platformFeePercent?: number;
 }
+

@@ -333,6 +333,7 @@ model User {
   dataExportJobs      DataExportJob[]       @relation("DataExportRequester")
   courseBackups       CourseBackup[]        @relation("CourseBackupRequester")
   leaderboardSnapshots LeaderboardSnapshot[]
+  payments            Payment[]
 
   @@map("users")
 }
@@ -623,6 +624,25 @@ model Enrollment {
 
   @@unique([studentId, courseId])
   @@map("enrollments")
+}
+
+// Issue #240: Payment receipt — one per on-chain transaction.
+// Prevents txHash reuse and ensures consistent amountPaid across all enrollments.
+model Payment {
+  id               String             @id @default(uuid())
+  txHash           String             @unique
+  studentId        String
+  amountPaid       Decimal            // USDC verified from on-chain transaction
+  paymentType      String             @default("ENROLLMENT") // ENROLLMENT | BUNDLE | REFUND
+  verifiedAt       DateTime           @default(now())
+  createdAt        DateTime           @default(now())
+
+  // Relations
+  student         User                @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@index([txHash])
+  @@map("payments")
 }
 
 model CourseDripConfig {
@@ -1341,7 +1361,7 @@ model BundleEnrollment {
   bundleId   String
   studentId  String
   amountPaid Decimal  // USDC
-  txHash     String?  // on-chain bundle purchase tx
+  txHash     String?  @unique // on-chain bundle purchase tx — unique per issue #240
   enrolledAt DateTime @default(now())
 
   // Relations
@@ -1889,3 +1909,4 @@ model CronJobRun {
   @@index([status])
   @@map("cron_job_runs")
 }
+

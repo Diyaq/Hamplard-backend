@@ -362,6 +362,7 @@ describe('CoursesService status transitions (issue #232)', () => {
       {} as any,
       mockSearchService as any,
       mockCache as any,
+      { get: jest.fn(() => 20) } as any,
     );
   });
 

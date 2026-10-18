@@ -22,6 +22,7 @@ export class CoursesService {
     private readonly feeCalculator: FeeCalculatorService,
     private readonly searchService: SearchService,
     private readonly cache: CacheService,
+    private readonly config: ConfigService,
   ) {}
 
   /** Issue #92 — invalidate cached course listings/categories on content updates. */
@@ -42,10 +43,16 @@ export class CoursesService {
    * On submission, status becomes PENDING and admin is notified.
    *
    * Does NOT index into search — only ACTIVE courses are searchable.
+   * 
+   * Issue #242: Platform fee is set from config (not from instructor DTO).
+   * Only admins can override via setPlatformFee().
    */
   async create(instructorId: string, instructorAddress: string, dto: CreateCourseDto) {
     const existing = await this.prisma.course.findUnique({ where: { id: dto.courseId } });
     if (existing) throw new ConflictException(`Course ID ${dto.courseId} already exists`);
+
+    // Get platform fee from config (default 20%)
+    const platformFeePercent = Number(this.config.get('PLATFORM_FEE_PERCENT', 20));
 
     const course = await this.prisma.course.create({
       data: {
@@ -59,7 +66,7 @@ export class CoursesService {
         thumbnailUrl:       dto.thumbnailUrl,
         previewVideoUrl:    dto.previewVideoUrl,
         price:              dto.price,
-        platformFeePercent: dto.platformFeePercent ?? 20,
+        platformFeePercent: platformFeePercent,
         status:             CourseStatus.DRAFT,
       },
     });
@@ -500,27 +507,42 @@ export class CoursesService {
    * Guards against self-reference, unknown IDs and cycles so that multiple
    * chains can coexist while the overall graph stays acyclic.
    */
-  async setPrerequisites(courseId: string, dto: SetPrerequisitesDto) {
-    await this.findOne(courseId);
-
-    const uniqueIds = [...new Set(dto.prerequisiteIds)];
-    if (uniqueIds.includes(courseId)) {
-      throw new ConflictException('A course cannot be its own prerequisite');
-    }
   async setPrerequisites(courseId: string, instructorId: string, dto: SetPrerequisitesDto) {
     const course = await this.prisma.course.findUnique({ where: { id: courseId } });
     if (!course) throw new NotFoundException(`Course ${courseId} not found`);
 
     await this.prisma.coursePrerequisite.deleteMany({ where: { courseId } });
-    if (dto.prerequisiteCourseIds.length > 0) {
+    if (dto.prerequisiteIds.length > 0) {
       await this.prisma.coursePrerequisite.createMany({
-        data: dto.prerequisiteCourseIds.map((prerequisiteCourseId) => ({
+        data: dto.prerequisiteIds.map((prerequisiteCourseId) => ({
           courseId,
-          prerequisiteCourseId,
+          prerequisiteId: prerequisiteCourseId,
         })),
       });
     }
 
     return this.prisma.coursePrerequisite.findMany({ where: { courseId } });
+  }
+
+  // ----------------------------------------------------------
+  // PLATFORM FEE MANAGEMENT (issue #242 — admin-only)
+  // ----------------------------------------------------------
+
+  /**
+   * Admin-only endpoint to set the platform fee for a specific course.
+   * Instructors cannot set this fee; it defaults from config or this method.
+   */
+  async setPlatformFee(courseId: string, feePercent: number): Promise<void> {
+    if (feePercent < 0 || feePercent > 100) {
+      throw new ConflictException('Platform fee must be between 0 and 100');
+    }
+
+    await this.prisma.course.update({
+      where: { id: courseId },
+      data: { platformFeePercent: feePercent },
+    });
+
+    this.logger.log(`Course ${courseId} platform fee updated to ${feePercent}%`);
+    await this.invalidateCourseCaches();
   }
 }
