@@ -3,7 +3,7 @@ import {
   Query, UseGuards, UseInterceptors, HttpCode, HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
-import { CoursesService } from './courses.service';
+import { CoursesService, CourseActor } from './courses.service';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { SetPrerequisitesDto } from './dto/set-prerequisites.dto';
@@ -96,10 +96,10 @@ export class CoursesController {
   @ApiOperation({ summary: 'Update course details (instructor)' })
   update(
     @Param('id') id: string,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: CourseActor,
     @Body() dto: UpdateCourseDto,
   ) {
-    return this.coursesService.update(id, userId, dto);
+    return this.coursesService.update(id, user, dto);
   }
 
   @Post(':id/submit')
@@ -110,10 +110,10 @@ export class CoursesController {
   @ApiOperation({ summary: 'Submit course for admin review (after on-chain registration)' })
   submitForReview(
     @Param('id') id: string,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: CourseActor,
     @Body() body: { txHash?: string },
   ) {
-    return this.coursesService.submitForReview(id, userId, body.txHash);
+    return this.coursesService.submitForReview(id, user, body.txHash);
   }
 
   // --------------------------------------------------------
@@ -178,8 +178,12 @@ export class CoursesController {
       '(empty array clears them). Rejects self-references and any configuration ' +
       'that would create a circular prerequisite chain (409).',
   })
-  setPrerequisites(@Param('id') id: string, @Body() dto: SetPrerequisitesDto) {
-    return this.coursesService.setPrerequisites(id, dto);
+  setPrerequisites(
+    @Param('id') id: string,
+    @CurrentUser() user: CourseActor,
+    @Body() dto: SetPrerequisitesDto,
+  ) {
+    return this.coursesService.setPrerequisites(id, user, dto);
   }
 
   @Delete(':id/prerequisites/:prerequisiteId')
@@ -191,7 +195,8 @@ export class CoursesController {
   removePrerequisite(
     @Param('id') id: string,
     @Param('prerequisiteId') prerequisiteId: string,
+    @CurrentUser() user: CourseActor,
   ) {
-    return this.coursesService.removePrerequisite(id, prerequisiteId);
+    return this.coursesService.removePrerequisite(id, user, prerequisiteId);
   }
 }

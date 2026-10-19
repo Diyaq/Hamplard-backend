@@ -9,7 +9,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { QuizSessionStatus } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { QuizAttemptsService, QuizAttemptResult } from './quiz-attempts.service';
-import { StartQuizSessionDto, SubmitSessionAnswersDto } from './dto/quiz-sessions.dto';
+import { SubmitSessionAnswersDto } from './dto/quiz-sessions.dto';
 
 export { QuizSessionStatus };
 
@@ -55,15 +55,9 @@ export class QuizSessionsService {
   async startSession(
     lessonId: string,
     userId: string,
-    dto: StartQuizSessionDto,
   ): Promise<QuizSessionStatusResponse> {
-    const lesson = await this.prisma.lesson.findUnique({
-      where: { id: lessonId },
-    });
-
-    if (!lesson) {
-      throw new NotFoundException('Lesson not found');
-    }
+    // Issue #238 — same enrollment / attempt-limit / cooldown gate as direct attempts.
+    await this.quizAttemptsService.assertCanAttempt(lessonId, userId);
 
     const questionCount = await this.prisma.quizQuestion.count({
       where: { lessonId },
@@ -73,7 +67,7 @@ export class QuizSessionsService {
       throw new BadRequestException('This lesson has no quiz questions in the bank');
     }
 
-    const durationMinutes = dto?.durationMinutes ?? 15;
+    const durationMinutes = lesson.quizDurationMinutes;
     const durationSeconds = durationMinutes * 60;
     const startTime = new Date();
     const expiresAt = new Date(startTime.getTime() + durationSeconds * 1000);
@@ -127,10 +121,7 @@ export class QuizSessionsService {
 
     const result = await this.quizAttemptsService.submitQuizAttempt(
       current.lessonId,
-      {
-        answers: dto.answers,
-        passThreshold: dto.passThreshold,
-      },
+      { answers: dto.answers },
       userId,
     );
 
@@ -150,25 +141,43 @@ export class QuizSessionsService {
   /**
    * Auto-submits a quiz session on timeout.
    */
-  async autoSubmitSession(
+  private async autoSubmitSession(
     sessionId: string,
     userId: string,
-    dto?: SubmitSessionAnswersDto,
   ): Promise<QuizSessionStatusResponse> {
     const session = await this.loadOwnedSession(sessionId, userId);
 
-    if (session.status === QuizSessionStatus.COMPLETED) {
+    if (
+      session.status !== QuizSessionStatus.IN_PROGRESS ||
+      new Date() < session.expiresAt
+    ) {
       return this.buildStatusResponse(session);
     }
 
     const answers = dto?.answers ?? [];
-    const passThreshold = dto?.passThreshold ?? 70;
 
+    let result: QuizAttemptResult;
+    try {
+      result = await this.quizAttemptsService.submitQuizAttempt(
+        session.lessonId,
+        { answers },
+        userId,
+      );
+    } catch (error) {
+      // Access revoked or attempt limit hit since the session started:
+      // close the session without grading so the sweep doesn't retry forever.
+      if (!(error instanceof ForbiddenException)) throw error;
+      const closed = (await this.prisma.quizSession.update({
+        where: { id: sessionId },
+        data: { status: QuizSessionStatus.EXPIRED, autoSubmitted: true },
+      })) as unknown as QuizSessionRow;
+      this.logger.warn(`Session ${sessionId} expired without grading: ${error.message}`);
+      return this.buildStatusResponse(closed);
+    }
     const result = await this.quizAttemptsService.submitQuizAttempt(
       session.lessonId,
       {
-        answers,
-        passThreshold,
+        answers: [],
       },
       userId,
     );

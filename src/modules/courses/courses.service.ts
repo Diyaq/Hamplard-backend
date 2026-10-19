@@ -7,10 +7,17 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { FeeCalculatorService } from '../billing/fee-calculator.service';
 import { SearchService, CourseSearchDocument } from '../search/search.service';
 import { CacheService } from '../../common/cache/cache.service';
-import { CourseStatus, NotificationType } from '@prisma/client';
+import { CourseStatus, NotificationType, UserRole } from '@prisma/client';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { SetPrerequisitesDto } from './dto/set-prerequisites.dto';
+
+/** Authenticated caller as attached to the request by JwtStrategy. */
+export interface CourseActor {
+  id: string;
+  stellarAddress?: string | null;
+  role: UserRole;
+}
 
 @Injectable()
 export class CoursesService {
@@ -33,6 +40,23 @@ export class CoursesService {
     ]);
   }
 
+  /**
+   * Issue #241 — only the course's instructor (matched by stellarAddress or id
+   * against `instructorAddress`) or an ADMIN may mutate a course.
+   */
+  assertCourseOwner(course: { instructorAddress: string }, user: CourseActor): void {
+    if (user.role === UserRole.ADMIN) return;
+
+    const isOwner =
+      (!!user.stellarAddress && user.stellarAddress === course.instructorAddress) ||
+      user.id === course.instructorAddress;
+
+    if (!isOwner) {
+      throw new ForbiddenException('Only the course instructor or an admin can modify this course');
+    }
+  }
+
+  // ----------------------------------------------------------
   // -----------------------------------------------------
   // CREATE
   // -----------------------------------------------------
@@ -84,6 +108,9 @@ export class CoursesService {
    * Instructor submits a DRAFT course for admin review → PENDING.
    * Called after the instructor has also registered the course on-chain.
    */
+  async submitForReview(courseId: string, user: CourseActor, txHash?: string) {
+    const course = await this.findOne(courseId);
+    this.assertCourseOwner(course, user);
   async submitForReview(courseId: string, instructorId: string, txHash?: string) {
     const course = await this.findOne(courseId, { isAdmin: true });
 
@@ -323,6 +350,9 @@ export class CoursesService {
     return categories.map((c) => ({ name: c.category, count: c._count.category }));
   }
 
+  async update(courseId: string, user: CourseActor, dto: UpdateCourseDto) {
+    const course = await this.findOne(courseId);
+    this.assertCourseOwner(course, user);
   async update(courseId: string, instructorId: string, dto: UpdateCourseDto) {
     const course = await this.findOne(courseId, { isAdmin: true });
     if (course.status === CourseStatus.ARCHIVED) {
@@ -507,6 +537,14 @@ export class CoursesService {
    * Guards against self-reference, unknown IDs and cycles so that multiple
    * chains can coexist while the overall graph stays acyclic.
    */
+  async setPrerequisites(courseId: string, user: CourseActor, dto: SetPrerequisitesDto) {
+    const course = await this.findOne(courseId);
+    this.assertCourseOwner(course, user);
+
+    const uniqueIds = [...new Set(dto.prerequisiteIds)];
+    if (uniqueIds.includes(courseId)) {
+      throw new ConflictException('A course cannot be its own prerequisite');
+    }
   async setPrerequisites(courseId: string, instructorId: string, dto: SetPrerequisitesDto) {
     const course = await this.prisma.course.findUnique({ where: { id: courseId } });
     if (!course) throw new NotFoundException(`Course ${courseId} not found`);
@@ -521,6 +559,99 @@ export class CoursesService {
       });
     }
 
+    await this.prisma.$transaction(async (tx) => {
+      await tx.coursePrerequisite.deleteMany({ where: { courseId } });
+      if (uniqueIds.length) {
+        await tx.coursePrerequisite.createMany({
+          data: uniqueIds.map((prerequisiteId) => ({ courseId, prerequisiteId })),
+        });
+      }
+    });
+
+    this.logger.log(
+      `Prerequisites for course ${courseId} replaced: [${uniqueIds.join(', ') || 'none'}]`,
+    );
+    return this.getPrerequisites(courseId);
+  }
+
+  async removePrerequisite(courseId: string, user: CourseActor, prerequisiteId: string) {
+    const course = await this.findOne(courseId);
+    this.assertCourseOwner(course, user);
+
+    const link = await this.prisma.coursePrerequisite.findUnique({
+      where: {
+        courseId_prerequisiteId: { courseId, prerequisiteId },
+      },
+    });
+    if (!link) {
+      throw new NotFoundException(
+        `Course ${courseId} has no prerequisite ${prerequisiteId}`,
+      );
+    }
+    await this.prisma.coursePrerequisite.delete({ where: { id: link.id } });
+    this.logger.log(`Prerequisite removed: ${prerequisiteId} ↛ ${courseId}`);
+    return { message: 'Prerequisite removed successfully' };
+  }
+
+  /**
+   * Detects a directed cycle in the "course requires prerequisite" graph
+   * using an iterative DFS with coloring. Returns the cycle path or null.
+   */
+  private findCycle(
+    edges: Array<{ courseId: string; prerequisiteId: string }>,
+  ): string[] | null {
+    const adjacency = new Map<string, string[]>();
+    for (const e of edges) {
+      if (!adjacency.has(e.courseId)) adjacency.set(e.courseId, []);
+      adjacency.get(e.courseId)!.push(e.prerequisiteId);
+    }
+
+    const WHITE = 0;
+    const GRAY = 1;
+    const BLACK = 2;
+    const color = new Map<string, number>();
+
+    for (const start of adjacency.keys()) {
+      if ((color.get(start) ?? WHITE) !== WHITE) continue;
+
+      // stack holds nodes plus their current path index for backtracking
+      const stack: Array<{ node: string; pathIndex: number }> = [{ node: start, pathIndex: 0 }];
+      const path: string[] = [];
+
+      while (stack.length) {
+        const frame = stack[stack.length - 1];
+        const neighbors = adjacency.get(frame.node) ?? [];
+
+        if (frame.pathIndex === 0) {
+          path.push(frame.node);
+          color.set(frame.node, GRAY);
+        }
+
+        let advanced = false;
+        while (frame.pathIndex < neighbors.length) {
+          const next = neighbors[frame.pathIndex];
+          frame.pathIndex += 1;
+          const nextColor = color.get(next) ?? WHITE;
+
+          if (nextColor === GRAY) {
+            const from = path.indexOf(next);
+            return [...path.slice(from), next];
+          }
+          if (nextColor === WHITE) {
+            stack.push({ node: next, pathIndex: 0 });
+            advanced = true;
+            break;
+          }
+        }
+
+        if (!advanced && frame.pathIndex >= neighbors.length) {
+          color.set(frame.node, BLACK);
+          path.pop();
+          stack.pop();
+        }
+      }
+    }
+    return null;
     return this.prisma.coursePrerequisite.findMany({ where: { courseId } });
   }
 
