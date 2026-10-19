@@ -10,7 +10,7 @@ import {
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { QuizSessionsService } from './quiz-sessions.service';
-import { StartQuizSessionDto, SubmitSessionAnswersDto } from './dto/quiz-sessions.dto';
+import { SubmitSessionAnswersDto } from './dto/quiz-sessions.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
@@ -28,10 +28,9 @@ export class QuizSessionsController {
   })
   startSession(
     @Param('lessonId') lessonId: string,
-    @Body() dto: StartQuizSessionDto,
     @CurrentUser('id') userId: string,
   ) {
-    return this.quizSessionsService.startSession(lessonId, userId, dto);
+    return this.quizSessionsService.startSession(lessonId, userId);
   }
 
   @Get('sessions/:sessionId')
@@ -58,16 +57,4 @@ export class QuizSessionsController {
     return this.quizSessionsService.submitSession(sessionId, userId, dto);
   }
 
-  @Post('sessions/:sessionId/auto-submit')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Auto-submit quiz session upon timer expiration',
-  })
-  autoSubmitSession(
-    @Param('sessionId') sessionId: string,
-    @Body() dto: SubmitSessionAnswersDto,
-    @CurrentUser('id') userId: string,
-  ) {
-    return this.quizSessionsService.autoSubmitSession(sessionId, userId, dto);
-  }
 }
