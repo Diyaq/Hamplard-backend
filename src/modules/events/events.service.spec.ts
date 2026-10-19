@@ -221,6 +221,8 @@ describe('EventsService — ledger checkpoint (Issue #80)', () => {
         mockStellar as any,
         mockNotifications as any,
         mockCourses as any,
+        { get: jest.fn() } as any,
+        buildMockScheduler() as any,
       );
       await restarted.onModuleInit();
       mockStellar.fetchContractEvents.mockReset().mockResolvedValue({

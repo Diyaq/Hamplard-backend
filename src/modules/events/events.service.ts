@@ -160,19 +160,68 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     this.isPolling = true;
 
     try {
+      let latestLedger: number | null = null;
+      try {
+        latestLedger = await this.stellar.getLatestLedger();
+      } catch {
+        this.logger.warn('Could not fetch latest ledger during poll');
+      }
+
       // RPC rejects a start ledger beyond its current tip. A cursor already
       // identifies an event within the retained range, so it needs no check.
-      if (!this.lastProcessedCursor && this.lastProcessedLedger > await this.stellar.getLatestLedger()) {
+      if (!this.lastProcessedCursor && latestLedger !== null && this.lastProcessedLedger > latestLedger) {
+        this.logger.warn(`Checkpoint ledger ${this.lastProcessedLedger} is ahead of latest ${latestLedger}`);
         return;
       }
 
       let count = 0;
       while (true) {
-        const page = await this.stellar.fetchContractEvents(
-          this.lastProcessedLedger,
-          this.lastProcessedCursor ?? undefined,
-        );
+        let page;
+        try {
+          page = await this.stellar.fetchContractEvents(
+            this.lastProcessedLedger,
+            this.lastProcessedCursor ?? undefined,
+          );
+        } catch (error) {
+          const errorMessage = error?.message ?? String(error);
+          
+          // Issue #228: Detect "start ledger out of range" error
+          if (errorMessage.includes('start ledger out of range') || 
+              errorMessage.includes('startLedger') ||
+              errorMessage.includes('too old')) {
+            this.logger.error(
+              `Event poller hit "start ledger out of range" error at ledger ${this.lastProcessedLedger}. ` +
+              `This means the RPC retention window no longer includes that ledger. ` +
+              `Jumping to the oldest available ledger (near the current tip).`,
+            );
+            
+            // Jump to a safe ledger near the current chain tip
+            if (latestLedger !== null) {
+              this.lastProcessedLedger = Math.max(1, latestLedger - COLD_START_LOOKBACK);
+            } else {
+              this.lastProcessedLedger = 1;
+            }
+            this.lastProcessedCursor = null;
+            
+            // Persist the recovery
+            await this.persistCheckpoint();
+            return; // Retry on the next poll tick
+          }
+          
+          throw error;
+        }
+
         const events = page.events ?? [];
+        
+        // Issue #228: When a poll returns no events, advance the checkpoint to
+        // the latest ledger returned by RPC so we don't get stuck.
+        if (events.length === 0 && page.latestLedger) {
+          this.lastProcessedLedger = Math.max(this.lastProcessedLedger, page.latestLedger + 1);
+          this.lastProcessedCursor = null;
+          this.logger.debug(`Empty poll; advanced checkpoint to ledger ${this.lastProcessedLedger}`);
+          break;
+        }
+
         for (const event of events) {
           const isNew = await this.processEvent(event);
           // Only advance the checkpoint past an event once it has been
@@ -184,7 +233,6 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
           if (!event.pagingToken || event.pagingToken === this.lastProcessedCursor) {
             throw new Error('RPC event has no advancing paging token');
           }
-          await this.processEvent(event);
           this.lastProcessedLedger = Math.max(this.lastProcessedLedger, event.ledger + 1);
           this.lastProcessedCursor = event.pagingToken;
           // A crash in the middle of a full page must resume at this event,
