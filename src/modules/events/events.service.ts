@@ -1,7 +1,8 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { PrismaService } from '../../common/prisma/prisma.service';
-import { StellarService } from '../../common/stellar/stellar.service';
+import { CONTRACT_EVENT_PAGE_LIMIT, StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CoursesService } from '../courses/courses.service';
 import { NotificationType } from '@prisma/client';
@@ -12,12 +13,23 @@ export const EVENT_POLLER_CHECKPOINT_KEY = 'stellar-event-poller';
 /** Number of ledgers to rewind behind the chain tip on a cold start. */
 const COLD_START_LOOKBACK = 10;
 
+/** Max length of the persisted handler error string. */
+const MAX_HANDLER_ERROR_LENGTH = 500;
+/** SchedulerRegistry name of the poll interval (issue #229). */
+export const EVENT_POLLER_INTERVAL_NAME = 'stellar-event-poller';
+
+/** Poll interval used when EVENT_POLLING_INTERVAL_MS is unset or invalid. */
+export const DEFAULT_EVENT_POLLING_INTERVAL_MS = 5000;
+
 export interface CheckpointStatus {
   key: string;
   /** Ledger the running process will poll from next. */
   lastProcessedLedger: number;
+  /** Token of the last event processed while a ledger range is being drained. */
+  lastProcessedCursor: string | null;
   /** Ledger currently persisted in the database (null if never written). */
   persistedLedger: number | null;
+  persistedCursor: string | null;
   lastPolledAt: Date | null;
   /** How the poller obtained its starting ledger on the last boot. */
   resumedFromCheckpoint: boolean;
@@ -30,25 +42,29 @@ export interface CheckpointStatus {
 /**
  * EventsService
  *
- * Polls Stellar RPC every 5 seconds for Hamplard contract events:
+ * Polls Stellar RPC every EVENT_POLLING_INTERVAL_MS (default 5s) for Hamplard
+ * contract events:
  *
  *   - course_registered    → log, backend already has the record from POST /courses
  *   - course_approved      → update course status in DB
- *   - student_enrolled     → update enrollment + course stats (safety net)
+ *   - student_enrolled     → reconcile with the API enrollment (no double counting)
  *   - course_completed     → trigger certificate issuance flow
  *   - certificate_issued   → update DB txHash, notify student
  *   - certificate_revoked  → update DB flag
  *   - course_paused        → update course status
  *   - course_archived      → update course status
  *
- * The last processed Stellar ledger is persisted to the `event_poller_checkpoints`
- * table after every poll. On boot the service resumes from that checkpoint so a
- * restart or crash does not skip events that landed while the process was down.
+ * The event cursor is persisted after each event. Once all available pages are
+ * drained, the checkpoint moves to the next ledger and clears the cursor.
  */
 @Injectable()
-export class EventsService implements OnModuleInit {
+export class EventsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(EventsService.name);
   private lastProcessedLedger = 0;
+  private lastProcessedCursor: string | null = null;
+
+  /** Re-entrancy guard — true while a poll is running (issue #229). */
+  private isPolling = false;
 
   // Checkpoint bookkeeping (in-memory mirror of the DB row).
   private resumedFromCheckpoint = false;
@@ -61,9 +77,40 @@ export class EventsService implements OnModuleInit {
     private readonly stellar: StellarService,
     private readonly notifications: NotificationsService,
     private readonly courses: CoursesService,
+    private readonly config: ConfigService,
+    private readonly schedulerRegistry: SchedulerRegistry,
   ) {}
 
   async onModuleInit() {
+    await this.initCheckpoint();
+    this.startPolling();
+  }
+
+  onModuleDestroy() {
+    if (this.schedulerRegistry.doesExist('interval', EVENT_POLLER_INTERVAL_NAME)) {
+      this.schedulerRegistry.deleteInterval(EVENT_POLLER_INTERVAL_NAME);
+    }
+  }
+
+  /** Poll interval from EVENT_POLLING_INTERVAL_MS, falling back to 5000 ms. */
+  getPollingIntervalMs(): number {
+    const raw = Number(this.config.get('EVENT_POLLING_INTERVAL_MS'));
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EVENT_POLLING_INTERVAL_MS;
+  }
+
+  /** Registers the poll loop with SchedulerRegistry (replaces the fixed 5s @Cron). */
+  private startPolling(): void {
+    if (this.schedulerRegistry.doesExist('interval', EVENT_POLLER_INTERVAL_NAME)) return;
+
+    const intervalMs = this.getPollingIntervalMs();
+    const interval = setInterval(() => {
+      void this.pollEvents();
+    }, intervalMs);
+    this.schedulerRegistry.addInterval(EVENT_POLLER_INTERVAL_NAME, interval);
+    this.logger.log(`Event poller scheduled every ${intervalMs} ms`);
+  }
+
+  private async initCheckpoint() {
     const checkpoint = await this.loadCheckpoint();
     let latestLedger: number | null = null;
     try {
@@ -77,6 +124,7 @@ export class EventsService implements OnModuleInit {
       // tip (e.g. restored from another network) — fall back to a cold start.
       if (latestLedger !== null && checkpoint.lastProcessedLedger > latestLedger + 1) {
         this.lastProcessedLedger = Math.max(1, latestLedger - COLD_START_LOOKBACK);
+        this.lastProcessedCursor = null;
         this.resumedFromCheckpoint = false;
         this.logger.warn(
           `Persisted checkpoint ledger ${checkpoint.lastProcessedLedger} is ahead of ` +
@@ -85,9 +133,10 @@ export class EventsService implements OnModuleInit {
         );
       } else {
         this.lastProcessedLedger = checkpoint.lastProcessedLedger;
+        this.lastProcessedCursor = checkpoint.lastProcessedCursor;
         this.resumedFromCheckpoint = true;
         this.logger.log(
-          `Resumed event poller from persisted ledger ${this.lastProcessedLedger}`,
+          `Resumed event poller from persisted ${this.lastProcessedCursor ? 'event cursor' : `ledger ${this.lastProcessedLedger}`}`,
         );
       }
       return;
@@ -101,26 +150,69 @@ export class EventsService implements OnModuleInit {
     await this.persistCheckpoint();
   }
 
-  @Cron(CronExpression.EVERY_5_SECONDS)
   async pollEvents() {
+    // Issue #229 — a slow RPC/DB round-trip must not let ticks overlap, which
+    // would process the same ledger range twice.
+    if (this.isPolling) {
+      this.logger.debug('Previous event poll still running; skipping this tick');
+      return;
+    }
+    this.isPolling = true;
+
     try {
-      const events = await this.stellar.fetchContractEvents(this.lastProcessedLedger);
+      // RPC rejects a start ledger beyond its current tip. A cursor already
+      // identifies an event within the retained range, so it needs no check.
+      if (!this.lastProcessedCursor && this.lastProcessedLedger > await this.stellar.getLatestLedger()) {
+        return;
+      }
 
-      if (events.length) {
-        this.logger.log(`Processing ${events.length} chain event(s)`);
-
+      let count = 0;
+      while (true) {
+        const page = await this.stellar.fetchContractEvents(
+          this.lastProcessedLedger,
+          this.lastProcessedCursor ?? undefined,
+        );
+        const events = page.events ?? [];
         for (const event of events) {
+          const isNew = await this.processEvent(event);
+          // Only advance the checkpoint past an event once it has been
+          // durably recorded; a duplicate (already-seen) event is safe to
+          // skip past since its row already exists.
+          if (isNew) {
+            this.lastProcessedLedger = Math.max(this.lastProcessedLedger, event.ledger + 1);
+          }
+          if (!event.pagingToken || event.pagingToken === this.lastProcessedCursor) {
+            throw new Error('RPC event has no advancing paging token');
+          }
           await this.processEvent(event);
           this.lastProcessedLedger = Math.max(this.lastProcessedLedger, event.ledger + 1);
+          this.lastProcessedCursor = event.pagingToken;
+          // A crash in the middle of a full page must resume at this event,
+          // rather than skipping the rest of its ledger.
+          await this.persistCheckpoint();
+          count += 1;
+        }
+
+        if (events.length < CONTRACT_EVENT_PAGE_LIMIT) {
+          // The range through latestLedger has been fully scanned. Start at
+          // the next ledger so an idle poller never holds an expiring cursor.
+          this.lastProcessedLedger = Math.max(this.lastProcessedLedger, page.latestLedger + 1);
+          this.lastProcessedCursor = null;
+          break;
         }
       }
+      if (count) this.logger.log(`Processed ${count} chain event(s)`);
     } catch (error) {
       this.logger.error('Event polling failed', error.message);
     } finally {
       // Persist progress even when a poll finds nothing — a checkpoint write
       // failure is logged but never allowed to stop the poll loop.
       this.lastPolledAt = new Date();
-      await this.persistCheckpoint();
+      try {
+        await this.persistCheckpoint();
+      } finally {
+        this.isPolling = false;
+      }
     }
   }
 
@@ -141,7 +233,7 @@ export class EventsService implements OnModuleInit {
   }
 
   /**
-   * Write the current ledger to the checkpoint row. Best-effort: a failure
+   * Write the current event position to the checkpoint row. Best-effort: a failure
    * increments the failure counter and is surfaced via the health endpoint,
    * but is swallowed so polling keeps running.
    */
@@ -152,10 +244,12 @@ export class EventsService implements OnModuleInit {
         create: {
           key: EVENT_POLLER_CHECKPOINT_KEY,
           lastProcessedLedger: this.lastProcessedLedger,
+          lastProcessedCursor: this.lastProcessedCursor,
           lastPolledAt: this.lastPolledAt,
         },
         update: {
           lastProcessedLedger: this.lastProcessedLedger,
+          lastProcessedCursor: this.lastProcessedCursor,
           lastPolledAt: this.lastPolledAt,
           lastWriteError: null,
           consecutiveWriteFailures: 0,
@@ -167,7 +261,7 @@ export class EventsService implements OnModuleInit {
       this.consecutiveWriteFailures += 1;
       this.lastWriteError = error?.message ?? String(error);
       this.logger.error(
-        `Failed to persist ledger checkpoint (consecutive failure ` +
+        `Failed to persist event checkpoint (consecutive failure ` +
           `#${this.consecutiveWriteFailures}); polling continues`,
         this.lastWriteError,
       );
@@ -201,7 +295,9 @@ export class EventsService implements OnModuleInit {
     return {
       key: EVENT_POLLER_CHECKPOINT_KEY,
       lastProcessedLedger: this.lastProcessedLedger,
+      lastProcessedCursor: this.lastProcessedCursor,
       persistedLedger: persisted?.lastProcessedLedger ?? null,
+      persistedCursor: persisted?.lastProcessedCursor ?? null,
       lastPolledAt: persisted?.lastPolledAt ?? this.lastPolledAt,
       resumedFromCheckpoint: this.resumedFromCheckpoint,
       consecutiveWriteFailures: this.consecutiveWriteFailures,
@@ -210,23 +306,42 @@ export class EventsService implements OnModuleInit {
     };
   }
 
-  private async processEvent(event: any) {
+  /**
+   * Persist the raw event and, if it is new, run its handler.
+   *
+   * Returns true when the event was newly inserted (handler was run), false
+   * when it was a duplicate that was skipped.
+   */
+  private async processEvent(event: any): Promise<boolean> {
     const eventName = this.extractEventName(event);
     const payload   = this.extractPayload(event);
 
-    await this.saveRawEvent(eventName, event, payload);
-
-    switch (eventName) {
-      case 'course_registered':    return this.handleCourseRegistered(payload);
-      case 'course_approved':      return this.handleCourseApproved(payload);
-      case 'course_paused':        return this.handleCoursePaused(payload);
-      case 'course_archived':      return this.handleCourseArchived(payload);
-      case 'student_enrolled':     return this.handleStudentEnrolled(payload);
-      case 'course_completed':     return this.handleCourseCompleted(payload);
-      case 'certificate_issued':   return this.handleCertificateIssued(payload);
-      case 'certificate_revoked':  return this.handleCertificateRevoked(payload);
-      default: this.logger.warn(`Unknown event: ${eventName}`);
+    const chainEventId = await this.saveRawEvent(eventName, event, payload);
+    if (chainEventId === null) {
+      // Duplicate event — already ingested and handled on a previous run.
+      return false;
     }
+
+    try {
+      switch (eventName) {
+        case 'course_registered':    await this.handleCourseRegistered(payload); break;
+        case 'course_approved':      await this.handleCourseApproved(payload); break;
+        case 'course_paused':        await this.handleCoursePaused(payload); break;
+        case 'course_archived':      await this.handleCourseArchived(payload); break;
+        case 'student_enrolled':     await this.handleStudentEnrolled(payload); break;
+        case 'course_completed':     await this.handleCourseCompleted(payload); break;
+        case 'certificate_issued':   await this.handleCertificateIssued(payload); break;
+        case 'certificate_revoked':  await this.handleCertificateRevoked(payload); break;
+        default: this.logger.warn(`Unknown event: ${eventName}`);
+      }
+      await this.markEventProcessed(chainEventId, true, null);
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      this.logger.error(`Handler for ${eventName} failed: ${message}`);
+      await this.markEventProcessed(chainEventId, false, message);
+    }
+
+    return true;
   }
 
   // ----------------------------------------------------------
@@ -243,12 +358,10 @@ export class EventsService implements OnModuleInit {
     const courseId = String(payload);
     this.logger.log(`Course approved on-chain: ${courseId}`);
     // Sync status — safety net for cases where admin called approve_course
-    // on-chain without going through the backend endpoint
+    // on-chain without going through the backend endpoint. Issue #232: the
+    // transition also indexes the course for search and purges list caches.
     try {
-      await this.prisma.course.update({
-        where: { id: courseId },
-        data: { status: 'ACTIVE', approvedAt: new Date() },
-      });
+      await this.courses.approveCourse(courseId);
     } catch (e) {
       this.logger.warn(`Could not sync course approval for ${courseId}: ${e.message}`);
     }
@@ -256,18 +369,14 @@ export class EventsService implements OnModuleInit {
 
   private async handleCoursePaused(payload: any) {
     const courseId = String(payload);
-    await this.prisma.course.updateMany({
-      where: { id: courseId },
-      data: { status: 'PAUSED' },
-    });
+    this.logger.log(`Course paused on-chain: ${courseId}`);
+    await this.courses.pauseCourse(courseId);
   }
 
   private async handleCourseArchived(payload: any) {
     const courseId = String(payload);
-    await this.prisma.course.updateMany({
-      where: { id: courseId },
-      data: { status: 'ARCHIVED' },
-    });
+    this.logger.log(`Course archived on-chain: ${courseId}`);
+    await this.courses.archiveCourse(courseId);
   }
 
   private async handleStudentEnrolled(payload: any) {
@@ -277,14 +386,36 @@ export class EventsService implements OnModuleInit {
       : [payload, null, null];
 
     this.logger.log(`Student enrolled on-chain: ${studentAddress} → ${courseId}`);
-    // Enrollment is primarily registered via POST /enrollments from the frontend.
-    // This handler updates course stats as a safety net.
-    if (courseId) {
-      await this.prisma.course.updateMany({
-        where: { id: String(courseId) },
-        data: { totalEnrollments: { increment: 1 } },
-      });
+    // Issue #231 — EnrollmentsService.create() (POST /enrollments) owns the
+    // enrollment row and the totalEnrollments/totalRevenue increment. This
+    // handler only reconciles, so a (student, course) pair is never counted
+    // twice — including when the same event is replayed after a restart.
+    if (!courseId || !studentAddress) return;
+
+    const student = await this.prisma.user.findUnique({
+      where: { stellarAddress: String(studentAddress) },
+      select: { id: true },
+    });
+    const enrollment = student
+      ? await this.prisma.enrollment.findUnique({
+          where: { studentId_courseId: { studentId: student.id, courseId: String(courseId) } },
+          select: { id: true },
+        })
+      : null;
+
+    if (enrollment) {
+      this.logger.debug(
+        `Enrollment ${enrollment.id} already registered via API; skipping stat update`,
+      );
+      return;
     }
+
+    // No backend record yet — POST /enrollments creates it and updates the
+    // stats when it lands, so incrementing here would double count.
+    this.logger.warn(
+      `On-chain enrollment ${studentAddress} → ${courseId} has no backend record yet; ` +
+        'awaiting API registration',
+    );
   }
 
   private async handleCourseCompleted(payload: any) {
@@ -361,23 +492,94 @@ export class EventsService implements OnModuleInit {
     catch { return null; }
   }
 
-  private async saveRawEvent(eventName: string, event: any, payload: any) {
+  /**
+   * Insert the raw event, skipping if it has already been seen.
+   *
+   * Returns the created ChainEvent id, or null when the event was a duplicate
+   * (unique constraint on eventId / txHash+eventIndex).
+   */
+  private async saveRawEvent(
+    eventName: string,
+    event: any,
+    payload: any,
+  ): Promise<string | null> {
     try {
       const courseId = typeof payload === 'string' ? payload :
         Array.isArray(payload) && typeof payload[0] === 'string' ? payload[0] : null;
 
-      await this.prisma.chainEvent.create({
+      const eventId = this.extractEventId(event);
+      const txHash = event.txHash ?? '';
+      const eventIndex = this.extractEventIndex(event);
+
+      const created = await this.prisma.chainEvent.create({
         data: {
           eventName,
           ledger:   event.ledger ?? 0,
-          txHash:   event.txHash ?? '',
+          txHash,
+          eventId,
+          eventIndex,
           payload:  payload ?? {},
           courseId: courseId || undefined,
         },
       });
+      return created.id;
     } catch (error) {
+      // P2002 = unique constraint violation → duplicate event, skip it.
+      if (error?.code === 'P2002') {
+        this.logger.debug(
+          `Skipping duplicate chain event ${this.extractEventId(event)} ` +
+            `(txHash=${event.txHash ?? ''})`,
+        );
+        return null;
+      }
       this.logger.error('Failed to save raw event', error.message);
+      return null;
     }
+  }
+
+  /** Record handler outcome on the raw event row. */
+  private async markEventProcessed(
+    id: string,
+    processed: boolean,
+    handlerError: string | null,
+  ): Promise<void> {
+    try {
+      await this.prisma.chainEvent.update({
+        where: { id },
+        data: {
+          processed,
+          handlerError: handlerError
+            ? handlerError.slice(0, MAX_HANDLER_ERROR_LENGTH)
+            : null,
+        },
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to update processed flag for chain event ${id}`,
+        error.message,
+      );
+    }
+  }
+
+  /**
+   * Stable identifier for an RPC event. Prefers the RPC-provided id; falls
+   * back to txHash + event index so older payloads still dedupe.
+   */
+  private extractEventId(event: any): string {
+    if (event?.id) return String(event.id);
+    const txHash = event?.txHash ?? '';
+    const index = this.extractEventIndex(event);
+    return `${txHash}:${index}`;
+  }
+
+  private extractEventIndex(event: any): number {
+    if (typeof event?.eventIndex === 'number') return event.eventIndex;
+    if (typeof event?.index === 'number') return event.index;
+    if (typeof event?.pagingToken === 'string') {
+      const parsed = Number(event.pagingToken);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
   }
 
   async findAll(courseId?: string, page = 1, limit = 20) {

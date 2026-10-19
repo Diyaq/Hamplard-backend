@@ -56,12 +56,13 @@ export class CoursesService {
   }
 
   // ----------------------------------------------------------
+  // -----------------------------------------------------
   // CREATE
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
 
   /**
    * Instructor creates a course draft in the backend DB.
-   * The course starts as DRAFT until the instructor submits it for review.
+   * The course starts as Draft until the instructor submits it for review.
    * On submission, status becomes PENDING and admin is notified.
    *
    * Does NOT index into search — only ACTIVE courses are searchable.
@@ -92,9 +93,9 @@ export class CoursesService {
     return course;
   }
 
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
   // SUBMIT FOR REVIEW
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
 
   /**
    * Instructor submits a DRAFT course for admin review → PENDING.
@@ -103,6 +104,8 @@ export class CoursesService {
   async submitForReview(courseId: string, user: CourseActor, txHash?: string) {
     const course = await this.findOne(courseId);
     this.assertCourseOwner(course, user);
+  async submitForReview(courseId: string, instructorId: string, txHash?: string) {
+    const course = await this.findOne(courseId, { isAdmin: true });
 
     if (course.status !== CourseStatus.DRAFT) {
       throw new ForbiddenException('Only DRAFT courses can be submitted for review');
@@ -118,12 +121,12 @@ export class CoursesService {
     return updated;
   }
 
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
   // APPROVE / REJECT (admin)
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
 
   async approve(courseId: string, adminId: string) {
-    const course = await this.findOne(courseId);
+    const course = await this.findOne(courseId, { isAdmin: true });
     if (course.status !== CourseStatus.PENDING) {
       throw new ForbiddenException('Only PENDING courses can be approved');
     }
@@ -156,7 +159,7 @@ export class CoursesService {
   }
 
   async reject(courseId: string, adminId: string, reason: string) {
-    const course = await this.findOne(courseId);
+    const course = await this.findOne(courseId, { isAdmin: true });
     if (course.status !== CourseStatus.PENDING) {
       throw new ForbiddenException('Only PENDING courses can be rejected');
     }
@@ -183,9 +186,9 @@ export class CoursesService {
     return updated;
   }
 
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
   // READ
-  // ----------------------------------------------------------
+  // -----------------------------------------------------
 
   async findAll(filters: {
     category?: string;
@@ -227,7 +230,19 @@ export class CoursesService {
     return { data: courses, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
   }
 
-  async findOne(id: string) {
+  /**
+   * Public course detail view.
+   *
+   * - Non-ACTIVE courses are hidden (404) unless the caller is the owner or an admin.
+   * - Owners/admins receive the full course with all lesson content.
+   * - Enrolled students receive the full curriculum.
+   * - Anonymous/non-enrolled callers receive a curriculum outline only
+   *   (title, type, duration, isFree) and content only for isFree lessons.
+   */
+  async findOne(
+    id: string,
+    viewer?: { userId?: string; stellarAddress?: string; isAdmin?: boolean },
+  ) {
     const course = await this.prisma.course.findUnique({
       where: { id },
       include: {
@@ -242,7 +257,80 @@ export class CoursesService {
       },
     });
     if (!course) throw new NotFoundException(`Course ${id} not found`);
-    return course;
+
+    const isOwner =
+      !!viewer?.stellarAddress && viewer.stellarAddress === course.instructorAddress;
+    const isAdmin = !!viewer?.isAdmin;
+
+    // Hide non-ACTIVE courses from everyone except the owner and admins.
+    if (course.status !== CourseStatus.ACTIVE && !isOwner && !isAdmin) {
+      throw new NotFoundException(`Course ${id} not found`);
+    }
+
+    // Owners and admins always get the full view.
+    if (isOwner || isAdmin) {
+      return course;
+    }
+
+    // Enrolled students get the full curriculum.
+    const isEnrolled = await this.isEnrolled(course.id, viewer);
+    if (isEnrolled) {
+      return course;
+    }
+
+    // Anonymous / non-enrolled callers: return a curriculum outline.
+    return this.toPublicOutline(course);
+  }
+
+  /** Returns true when the viewer has an active enrollment in the course. */
+  private async isEnrolled(
+    courseId: string,
+    viewer?: { userId?: string; stellarAddress?: string },
+  ): Promise<boolean> {
+    if (!viewer?.userId && !viewer?.stellarAddress) return false;
+    const enrollment = await this.prisma.enrollment.findFirst({
+      where: {
+        courseId,
+        ...(viewer.userId
+          ? { userId: viewer.userId }
+          : { user: { stellarAddress: viewer.stellarAddress } }),
+      },
+      select: { id: true },
+    });
+    return !!enrollment;
+  }
+
+  /**
+   * Strips paid lesson content from a course, keeping only the outline
+   * fields (title, type, duration, isFree) plus content for free lessons.
+   */
+  private toPublicOutline(course: any) {
+    return {
+      ...course,
+      modules: course.modules.map((module: any) => ({
+        ...module,
+        lessons: module.lessons.map((lesson: any) => {
+          const base = {
+            id: lesson.id,
+            moduleId: lesson.moduleId,
+            title: lesson.title,
+            type: lesson.type,
+            duration: lesson.duration,
+            position: lesson.position,
+            isFree: lesson.isFree,
+          };
+          if (lesson.isFree) {
+            return {
+              ...base,
+              videoUrl: lesson.videoUrl,
+              content: lesson.content,
+              resourceUrl: lesson.resourceUrl,
+            };
+          }
+          return base;
+        }),
+      })),
+    };
   }
 
   async getCategories() {
@@ -258,6 +346,8 @@ export class CoursesService {
   async update(courseId: string, user: CourseActor, dto: UpdateCourseDto) {
     const course = await this.findOne(courseId);
     this.assertCourseOwner(course, user);
+  async update(courseId: string, instructorId: string, dto: UpdateCourseDto) {
+    const course = await this.findOne(courseId, { isAdmin: true });
     if (course.status === CourseStatus.ARCHIVED) {
       throw new ForbiddenException('Cannot update an archived course');
     }
@@ -266,35 +356,28 @@ export class CoursesService {
 
     // Re-index if the course is active (search index should reflect changes)
     if (updated.status === CourseStatus.ACTIVE) {
-      await this.indexCourseForSearch(courseId);
+      await this.indexCourseForSearch(updated.id);
     }
 
     await this.invalidateCourseCaches();
-
     return updated;
   }
 
-  // ----------------------------------------------------------
-  // CHECKOUT
-  // ----------------------------------------------------------
-
-  /** Computes the platform fee + regional tax breakdown for checkout. */
-  async getCheckoutBreakdown(courseId: string, region?: string) {
+  private async indexCourseForSearch(courseId: string): Promise<void> {
     const course = await this.prisma.course.findUnique({
       where: { id: courseId },
-      select: { id: true, title: true, price: true, platformFeePercent: true },
+      include: { instructor: { select: { name: true } } },
     });
-    if (!course) throw new NotFoundException(`Course ${courseId} not found`);
-
-    return {
-      courseId: course.id,
-      courseTitle: course.title,
-      ...(await this.feeCalculator.computeBreakdown({
-        coursePrice: Number(course.price),
-        platformFeePercent: course.platformFeePercent,
-        region,
-      })),
+    if (!course) return;
+    const doc: CourseSearchDocument = {
+      id: course.id,
+      title: course.title,
+      description: course.description,
+      category: course.category,
+      level: course.level,
+      instructorName: course.instructor?.name,
     };
+    await this.searchService.indexCourse(doc);
   }
 
   async updateStats(courseId: string, delta: { enrollments?: number; revenue?: number }) {
@@ -309,8 +392,69 @@ export class CoursesService {
   }
 
   // ----------------------------------------------------------
+  // STATUS TRANSITIONS (issue #232)
+  // ----------------------------------------------------------
+  // Used by on-chain event sync and auto-moderation. Each transition keeps
+  // the Meilisearch index and the Redis course-list caches in step with the
+  // DB status: only ACTIVE courses are indexed.
+
+  /** Marks a course ACTIVE, indexes it for search and purges list caches. */
+  async approveCourse(courseId: string): Promise<boolean> {
+    const { count } = await this.prisma.course.updateMany({
+      where: { id: courseId },
+      data: { status: CourseStatus.ACTIVE, approvedAt: new Date() },
+    });
+    if (!count) {
+      this.logger.warn(`approveCourse: course ${courseId} not found`);
+      return false;
+    }
+
+    await this.indexCourseForSearch(courseId);
+    await this.invalidateCourseCaches();
+    this.logger.log(`Course ${courseId} → ACTIVE (indexed for search)`);
+    return true;
+  }
+
+  /** Marks a course PAUSED, removes it from search and purges list caches. */
+  async pauseCourse(courseId: string): Promise<boolean> {
+    return this.delistCourse(courseId, CourseStatus.PAUSED);
+  }
+
+  /** Marks a course ARCHIVED, removes it from search and purges list caches. */
+  async archiveCourse(courseId: string): Promise<boolean> {
+    return this.delistCourse(courseId, CourseStatus.ARCHIVED);
+  }
+
+  private async delistCourse(courseId: string, status: CourseStatus): Promise<boolean> {
+    const { count } = await this.prisma.course.updateMany({
+      where: { id: courseId },
+      data: { status },
+    });
+    if (!count) {
+      this.logger.warn(`Cannot set course ${courseId} to ${status}: not found`);
+      return false;
+    }
+
+    await this.removeCourseFromSearch(courseId);
+    await this.invalidateCourseCaches();
+    this.logger.log(`Course ${courseId} → ${status} (removed from search)`);
+    return true;
+  }
+
+  // ----------------------------------------------------------
   // SEARCH INDEX HELPERS
   // ----------------------------------------------------------
+
+  /** Removes a course from the search index; failures are logged, not thrown. */
+  private async removeCourseFromSearch(courseId: string): Promise<void> {
+    try {
+      await this.searchService.removeCourse(courseId);
+    } catch (err) {
+      this.logger.error(
+        `Failed to remove course ${courseId} from search index: ${(err as Error).message}`,
+      );
+    }
+  }
 
   /**
    * Builds a search document from the course in the database and
@@ -394,32 +538,18 @@ export class CoursesService {
     if (uniqueIds.includes(courseId)) {
       throw new ConflictException('A course cannot be its own prerequisite');
     }
+  async setPrerequisites(courseId: string, instructorId: string, dto: SetPrerequisitesDto) {
+    const course = await this.prisma.course.findUnique({ where: { id: courseId } });
+    if (!course) throw new NotFoundException(`Course ${courseId} not found`);
 
-    if (uniqueIds.length) {
-      const courses = await this.prisma.course.findMany({
-        where: { id: { in: uniqueIds } },
-        select: { id: true, title: true },
+    await this.prisma.coursePrerequisite.deleteMany({ where: { courseId } });
+    if (dto.prerequisiteCourseIds.length > 0) {
+      await this.prisma.coursePrerequisite.createMany({
+        data: dto.prerequisiteCourseIds.map((prerequisiteCourseId) => ({
+          courseId,
+          prerequisiteCourseId,
+        })),
       });
-      const missing = uniqueIds.filter((id) => !courses.some((c) => c.id === id));
-      if (missing.length) {
-        throw new NotFoundException(`Unknown prerequisite course ID(s): ${missing.join(', ')}`);
-      }
-    }
-
-    // Simulate the FULL edge set after the replacement.
-    const existing = await this.prisma.coursePrerequisite.findMany({
-      select: { courseId: true, prerequisiteId: true },
-    });
-    const finalEdges = [
-      ...existing.filter((e) => e.courseId !== courseId),
-      ...uniqueIds.map((prerequisiteId) => ({ courseId, prerequisiteId })),
-    ];
-
-    const cycle = this.findCycle(finalEdges);
-    if (cycle) {
-      throw new ConflictException(
-        `Setting these prerequisites would create a circular chain: ${cycle.join(' → ')}`,
-      );
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -515,5 +645,6 @@ export class CoursesService {
       }
     }
     return null;
+    return this.prisma.coursePrerequisite.findMany({ where: { courseId } });
   }
 }

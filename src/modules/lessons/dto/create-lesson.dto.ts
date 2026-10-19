@@ -38,6 +38,16 @@ export class CreateLessonDto {
   @Min(0)
   videoDuration?: number;
 
+  @ApiPropertyOptional({
+    description: 'Timed quiz duration in minutes',
+    default: 15,
+    example: 30,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  quizDurationMinutes?: number;
+
   @ApiPropertyOptional({ description: 'URL of the lesson thumbnail' })
   @IsOptional()
   @IsString()

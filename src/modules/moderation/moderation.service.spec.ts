@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ModerationService, DEFAULT_UNPUBLISH_THRESHOLD } from './moderation.service';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { CoursesService } from '../courses/courses.service';
 import { ReportCategory, ReportTargetType, ReportStatus, CourseStatus } from '@prisma/client';
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 
@@ -27,6 +28,10 @@ const mockPrisma = {
   },
 };
 
+const mockCourses = {
+  pauseCourse: jest.fn().mockResolvedValue(true),
+};
+
 describe('ModerationService', () => {
   let service: ModerationService;
 
@@ -35,6 +40,7 @@ describe('ModerationService', () => {
       providers: [
         ModerationService,
         { provide: PrismaService, useValue: mockPrisma },
+        { provide: CoursesService, useValue: mockCourses },
       ],
     }).compile();
 
@@ -79,10 +85,7 @@ describe('ModerationService', () => {
         id: 'course-1',
         status: CourseStatus.ACTIVE,
       });
-      mockPrisma.course.update.mockResolvedValue({
-        id: 'course-1',
-        status: CourseStatus.PAUSED,
-      });
+      mockCourses.pauseCourse.mockResolvedValue(true);
 
       const result = await service.createFlag('user-3', {
         targetType: ReportTargetType.COURSE,
@@ -92,10 +95,28 @@ describe('ModerationService', () => {
 
       expect(result.pendingCount).toBe(3);
       expect(result.autoActionTaken).toBe(true);
-      expect(mockPrisma.course.update).toHaveBeenCalledWith({
-        where: { id: 'course-1' },
-        data: { status: CourseStatus.PAUSED },
+      // Issue #232 — pauseCourse also removes from search and purges caches
+      expect(mockCourses.pauseCourse).toHaveBeenCalledWith('course-1');
+      expect(mockPrisma.course.update).not.toHaveBeenCalled();
+    });
+
+    it('does not pause an already-paused course on threshold (issue #232)', async () => {
+      mockPrisma.abuseReport.findFirst.mockResolvedValue(null);
+      mockPrisma.abuseReport.create.mockResolvedValue({ id: 'flag-4' });
+      mockPrisma.abuseReport.groupBy.mockResolvedValue(reporterGroups(3));
+      mockPrisma.course.findUnique.mockResolvedValue({
+        id: 'course-1',
+        status: CourseStatus.PAUSED,
       });
+
+      const result = await service.createFlag('user-4', {
+        targetType: ReportTargetType.COURSE,
+        targetId: 'course-1',
+        category: ReportCategory.SPAM,
+      });
+
+      expect(result.autoActionTaken).toBe(false);
+      expect(mockCourses.pauseCourse).not.toHaveBeenCalled();
     });
 
     it('rejects duplicate pending flags from the same reporter for the same target', async () => {

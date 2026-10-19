@@ -6,7 +6,47 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ExamsService } from '../exams/exams.service';
-import { NotificationType } from '@prisma/client';
+import { NotificationType, Prisma, UserRole } from '@prisma/client';
+import { UploadsService } from '../uploads/uploads.service';
+
+/**
+ * Issue #246 — projection for the unauthenticated certificate endpoints.
+ * Revocation is exposed only as status flags; the revoking admin's identity
+ * (`revokedBy` / `revokedById`), internal user ids and the stored PDF path
+ * are never selected.
+ */
+export const PUBLIC_CERTIFICATE_SELECT = {
+  id: true,
+  courseId: true,
+  courseTitle: true,
+  instructorAddress: true,
+  txHash: true,
+  isRevoked: true,
+  revokedAt: true,
+  issuedAt: true,
+  student: { select: { name: true, stellarAddress: true } },
+  course: {
+    select: {
+      id: true,
+      title: true,
+      category: true,
+      level: true,
+      thumbnailUrl: true,
+      instructor: { select: { name: true, stellarAddress: true } },
+    },
+  },
+} satisfies Prisma.CertificateSelect;
+
+export type PublicCertificate = Prisma.CertificateGetPayload<{
+  select: typeof PUBLIC_CERTIFICATE_SELECT;
+}>;
+
+/** Authenticated caller requesting a certificate download. */
+export interface CertificateRequester {
+  id: string;
+  stellarAddress?: string | null;
+  role: UserRole;
+}
 import { CertificateRenderData } from './certificate-template.types';
 import { v4 as uuidv4 } from 'uuid';
 import { CertificatePdfService } from '../certificates/certificate-pdf.service';
@@ -21,6 +61,7 @@ export class CertificatesService {
     private readonly notifications: NotificationsService,
     private readonly examsService: ExamsService,
     private readonly pdfService: CertificatePdfService,
+    private readonly uploads: UploadsService,
   ) {}
 
   /**
@@ -89,8 +130,9 @@ export class CertificatesService {
       renderData,
     );
 
-    // Store PDF file reference (in production this would be uploaded to S3/cloud storage)
-    const pdfUrl = `certificates/${certificateId}.pdf`;
+    // Issue #245 — persist the PDF so it can actually be downloaded later.
+    const stored = await this.uploads.saveBuffer(pdfBuffer, 'certificates', `${certificateId}.pdf`);
+    const pdfUrl = stored.originUrl;
     const updatedCert = await this.prisma.certificate.update({
       where: { id: certificateId },
       data: { pdfUrl },
@@ -125,6 +167,10 @@ export class CertificatesService {
     });
   }
 
+  /**
+   * Full certificate record including the revoking admin. Internal use and
+   * admin-only routes — public endpoints must use `findPublicById` (#246).
+   */
   async findById(certificateId: string) {
     const cert = await this.prisma.certificate.findUnique({
       where: { id: certificateId },
@@ -138,12 +184,62 @@ export class CertificatesService {
     return cert;
   }
 
+  /** Issue #246 — public certificate lookup without admin PII. */
+  async findPublicById(certificateId: string): Promise<PublicCertificate> {
+    const cert = await this.prisma.certificate.findUnique({
+      where: { id: certificateId },
+      select: PUBLIC_CERTIFICATE_SELECT,
+    });
+    if (!cert) throw new NotFoundException('Certificate not found');
+    return cert;
+  }
+
+  /**
+   * Issue #245 — returns the PDF bytes for the certificate holder or an ADMIN.
+   * Certificates issued before PDFs were persisted have no file on disk; they
+   * are re-rendered and stored on first download.
+   */
+  async getPdfForDownload(
+    certificateId: string,
+    user: CertificateRequester,
+  ): Promise<{ buffer: Buffer; filename: string }> {
+    const cert = await this.findById(certificateId);
+
+    const isAdmin = user.role === UserRole.ADMIN;
+    const isHolder =
+      cert.studentId === user.id ||
+      (!!user.stellarAddress && cert.student?.stellarAddress === user.stellarAddress);
+    if (!isAdmin && !isHolder) {
+      throw new ForbiddenException('Only the certificate holder or an admin can download this certificate');
+    }
+
+    let buffer = cert.pdfUrl ? this.uploads.readStoredFile(cert.pdfUrl) : null;
+
+    if (!buffer) {
+      buffer = await this.pdfService.renderForCategory(cert.course.category, {
+        studentName:   cert.student.name,
+        courseTitle:   cert.courseTitle,
+        certificateId: cert.id,
+        issuedAt:      cert.issuedAt,
+        category:      cert.course.category,
+      });
+      const stored = await this.uploads.saveBuffer(buffer, 'certificates', `${cert.id}.pdf`);
+      await this.prisma.certificate.update({
+        where: { id: cert.id },
+        data: { pdfUrl: stored.originUrl },
+      });
+      this.logger.log(`Re-generated missing PDF for certificate ${cert.id}`);
+    }
+
+    return { buffer, filename: `certificate-${cert.id}.pdf` };
+  }
+
   /**
    * Public verification endpoint — checks both DB and on-chain state.
    * Returns the certificate details if valid, or an error if revoked/not found.
    */
   async verify(certificateId: string) {
-    const cert = await this.findById(certificateId);
+    const cert = await this.findPublicById(certificateId);
 
     if (cert.isRevoked) {
       return { valid: false, reason: 'Certificate has been revoked', certificate: null };

@@ -214,5 +214,26 @@ describe('AuthService', () => {
       expect(twoFactor.verifyLoginCode).toHaveBeenCalledWith('user-2fa', '123456');
       expect(result.accessToken).toBe('access-jwt');
     });
+
+    it('never returns the TOTP secret or recovery-code hashes in the login payload (issue #234)', async () => {
+      const keypair = Keypair.random();
+      const service = buildService();
+      const payload = signedLoginPayload(service, keypair);
+      const user = {
+        ...twoFactorUser(payload.stellarAddress),
+        twoFactorSecret: 'JBSWY3DPEHPK3PXP',
+        twoFactorRecoveryCodes: ['$2b$10$hash1', '$2b$10$hash2'],
+      };
+      prisma.user.findUnique.mockResolvedValue(user);
+      prisma.user.upsert.mockResolvedValue(user);
+      twoFactor.verifyLoginCode.mockResolvedValue(true);
+
+      const result = await service.login({ ...payload, totpCode: '123456' });
+
+      expect(result.user).not.toHaveProperty('twoFactorSecret');
+      expect(result.user).not.toHaveProperty('twoFactorRecoveryCodes');
+      expect(result.user).toMatchObject({ id: 'user-2fa', twoFactorEnabled: true });
+      expect(JSON.stringify(result)).not.toContain('JBSWY3DPEHPK3PXP');
+    });
   });
 });

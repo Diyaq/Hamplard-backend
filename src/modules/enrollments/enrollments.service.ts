@@ -6,7 +6,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { InvoicesService } from '../invoices/invoices.service';
 import { ReferralsService } from '../referrals/referrals.service';
-import { NotificationType } from '@prisma/client';
+import { NotificationType, Prisma } from '@prisma/client';
 import { FraudDetectionService } from './fraud-detection.service';
 import { DripScheduleService } from '../lessons/drip-schedule.service';
 
@@ -87,17 +87,27 @@ export class EnrollmentsService {
     }
 
     // ------------------------------------------------------------------
-    // Create enrollment record
+    // Create enrollment record. A concurrent duplicate request can pass the
+    // existence check above; the (studentId, courseId) unique constraint then
+    // rejects it here, before course stats are touched (issue #231).
     // ------------------------------------------------------------------
-    const enrollment = await this.prisma.enrollment.create({
-      data: {
-        studentId,
-        courseId,
-        txHash,
-        amountPaid,
-      },
-      include: { course: true, student: true },
-    });
+    let enrollment;
+    try {
+      enrollment = await this.prisma.enrollment.create({
+        data: {
+          studentId,
+          courseId,
+          txHash,
+          amountPaid,
+        },
+        include: { course: true, student: true },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('Already enrolled in this course');
+      }
+      throw error;
+    }
 
     // ------------------------------------------------------------------
     // POST-CHECK: Persist fraud flag if score is HIGH (FLAG action).

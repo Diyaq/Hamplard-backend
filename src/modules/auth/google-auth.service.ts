@@ -12,6 +12,7 @@ import { randomBytes } from 'crypto';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { SessionsService, DeviceMetadata } from './sessions.service';
+import { toSafeUser } from '../users/user-serializer';
 
 export interface GoogleIdentity {
   googleId: string;
@@ -143,7 +144,8 @@ export class GoogleAuthService {
         });
       }
 
-      return { ...tokens, user };
+      // Issue #234 — never return the TOTP secret or recovery-code hashes
+      return { ...tokens, user: toSafeUser(user) };
     } catch (error) {
       if (error?.code === 'P2002') {
         throw new ConflictException('Google account is already linked to another user');

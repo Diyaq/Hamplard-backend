@@ -1,10 +1,10 @@
 import {
   Controller, Get, Post, Patch, Body, Param, UseGuards, HttpCode, HttpStatus,
   Res,
-  NotFoundException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
-import { CertificatesService } from './certificates.service';
+import { ApiTags, ApiOperation, ApiBearerAuth, ApiProduces } from '@nestjs/swagger';
+import { Response } from 'express';
+import { CertificatesService, CertificateRequester } from './certificates.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../../common/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -29,9 +29,9 @@ export class CertificatesController {
   }
 
   @Get(':id')
-  @ApiOperation({ summary: 'Get full certificate details by ID (public)' })
+  @ApiOperation({ summary: 'Get public certificate details by ID (public, no admin PII)' })
   findOne(@Param('id') id: string) {
-    return this.certificatesService.findById(id);
+    return this.certificatesService.findPublicById(id);
   }
 
   /** Protected routes below */
@@ -55,6 +55,15 @@ export class CertificatesController {
     @Body() dto: IssueCertificateDto,
   ) {
     return this.certificatesService.issue(adminId, dto.studentId, dto.courseId);
+  }
+
+  @Get(':id/admin')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: '[Admin] Get full certificate details including revocation audit info' })
+  findOneForAdmin(@Param('id') id: string) {
+    return this.certificatesService.findById(id);
   }
 
   @Patch(':id/tx-hash')
@@ -83,17 +92,22 @@ export class CertificatesController {
   @Get(':id/download')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Download the PDF certificate by ID' })
-  async download(@Param('id') id: string, @Res() res: any) {
-    const certificate = await this.certificatesService.findById(id);
+  @ApiProduces('application/pdf')
+  @ApiOperation({ summary: 'Download the PDF certificate (holder or admin only)' })
+  async download(
+    @Param('id') id: string,
+    @CurrentUser() user: CertificateRequester,
+    @Res() res: Response,
+  ) {
+    // Throws 403/404 before any headers are written (issue #245).
+    const { buffer, filename } = await this.certificatesService.getPdfForDownload(id, user);
 
-    if (!certificate.pdfUrl) {
-      throw new NotFoundException('PDF certificate not found for this ID');
-    }
-
-    res.json({
-      pdfUrl: certificate.pdfUrl,
-      message: 'PDF certificate ready for download',
+    res.set({
+      'Content-Type':        'application/pdf',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length':      String(buffer.length),
+      'Cache-Control':       'private, no-store',
     });
+    res.end(buffer);
   }
 }
