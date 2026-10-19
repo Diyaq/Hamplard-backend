@@ -19,6 +19,7 @@ import { SessionsController } from './sessions.controller';
 import { SessionsService } from './sessions.service';
 import { TwoFactorController } from './two-factor.controller';
 import { TwoFactorService } from './two-factor.service';
+import { CacheService } from '../../common/cache/cache.service';
 
 import { ThrottlerModule } from '@nestjs/throttler';
 
@@ -61,6 +62,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
     SessionsService,
     RefreshTokenService,
     TwoFactorService,
+    CacheService,
   ],
   exports: [AuthService, OtpService, SessionsService],
 })

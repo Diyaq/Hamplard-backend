@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { randomInt, createHmac, timingSafeEqual } from 'crypto';
 
 export class TooManyRequestsException extends HttpException {
   constructor(message: string = 'Too Many Requests') {
@@ -26,6 +27,7 @@ export class OtpService {
   private readonly logger = new Logger(OtpService.name);
   private readonly smsClient: any;
   private readonly rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+  private readonly hmacSecret: string;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -36,18 +38,43 @@ export class OtpService {
 
     if (!username || !apiKey) {
       this.logger.warn(
-        'Africa\'s Talking credentials not configured. SMS functionality will be disabled.',
+        "Africa's Talking credentials not configured. SMS functionality will be disabled.",
       );
     } else {
       this.smsClient = africastalking({ username, apiKey }).SMS;
     }
+
+    // OTP_HMAC_SECRET must be set in production. Fall back only in development.
+    this.hmacSecret =
+      this.config.get<string>('OTP_HMAC_SECRET') ??
+      this.config.get<string>('JWT_SECRET') ??
+      'dev-only-fallback-secret';
   }
 
   /**
-   * Generate a random 6-digit OTP
+   * Generate a cryptographically secure 6-digit OTP using crypto.randomInt.
    */
   private generateOtp(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    // randomInt(min, max) returns an integer in [min, max)
+    return randomInt(100_000, 1_000_000).toString();
+  }
+
+  /**
+   * Derive an HMAC-SHA256 hash of the OTP code so it is never stored in plaintext.
+   */
+  private hashOtp(otp: string): string {
+    return createHmac('sha256', this.hmacSecret).update(otp).digest('hex');
+  }
+
+  /**
+   * Constant-time comparison of the submitted OTP against the stored HMAC hash.
+   */
+  private verifyOtpHash(submitted: string, storedHash: string): boolean {
+    const submittedHash = this.hashOtp(submitted);
+    const a = Buffer.from(submittedHash, 'hex');
+    const b = Buffer.from(storedHash, 'hex');
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
   }
 
   /**
@@ -77,7 +104,9 @@ export class OtpService {
   }
 
   /**
-   * Send OTP to phone number via Africa's Talking SMS
+   * Send OTP to phone number via Africa's Talking SMS.
+   * The plaintext code is never written to the database; only an HMAC hash is stored.
+   * Outside NODE_ENV=development the code is also never written to logs.
    */
   async sendOtp(userId: string, phoneNumber: string, countryCode: string): Promise<void> {
     // Rate limit check
@@ -95,27 +124,29 @@ export class OtpService {
       },
     });
 
-    // Generate new OTP
+    // Generate new OTP with crypto.randomInt (CSPRNG)
     const otp = this.generateOtp();
+    const otpHash = this.hashOtp(otp);
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
 
-    // Store OTP in database
+    // Store only the HMAC hash — never the plaintext code
     await this.prisma.phoneOtp.create({
       data: {
         userId,
         phoneNumber,
         countryCode,
-        otp,
+        otp: otpHash,
         expiresAt,
       },
     });
 
     // Send SMS
     if (!this.smsClient) {
-      this.logger.warn(`SMS client not configured. OTP for ${phoneNumber}: ${otp}`);
-      // In development, log the OTP (remove in production)
+      // Only reveal the OTP in development; never log it in other environments
       if (this.config.get<string>('NODE_ENV') === 'development') {
-        this.logger.log(`[DEV] OTP for ${phoneNumber}: ${otp}`);
+        this.logger.debug(`[DEV] SMS client not configured. OTP for ${phoneNumber}: ${otp}`);
+      } else {
+        this.logger.warn('SMS client not configured. OTP was generated but not delivered.');
       }
       return;
     }
@@ -138,7 +169,7 @@ export class OtpService {
   }
 
   /**
-   * Verify OTP submitted by user
+   * Verify OTP submitted by user using constant-time HMAC comparison.
    */
   async verifyOtp(userId: string, phoneNumber: string, otpCode: string): Promise<boolean> {
     // Find the most recent unused OTP for this user and phone
@@ -177,8 +208,10 @@ export class OtpService {
       );
     }
 
-    // Verify OTP
-    if (otpRecord.otp !== otpCode) {
+    // Constant-time HMAC comparison — storedHash vs hash(submitted)
+    const isValid = this.verifyOtpHash(otpCode, otpRecord.otp);
+
+    if (!isValid) {
       // Increment attempt count
       await this.prisma.phoneOtp.update({
         where: { id: otpRecord.id },

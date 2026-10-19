@@ -13,6 +13,8 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { SessionsService, DeviceMetadata } from './sessions.service';
 import { toSafeUser } from '../users/user-serializer';
+import { CacheService } from '../../common/cache/cache.service';
+import { TwoFactorService } from './two-factor.service';
 
 export interface GoogleIdentity {
   googleId: string;
@@ -22,12 +24,18 @@ export interface GoogleIdentity {
   avatarUrl?: string;
 }
 
+/** TTL (seconds) for the one-time auth code handed to the frontend callback. */
+const AUTH_CODE_TTL_SECONDS = 60;
+
+/** TTL (seconds) for an OAuth state value stored in Redis. */
+const OAUTH_STATE_TTL_SECONDS = 5 * 60;
+
 @Injectable()
 export class GoogleAuthService {
   private readonly logger = new Logger(GoogleAuthService.name);
   private readonly googleClient?: OAuth2Client;
   private readonly clientId?: string;
-  private readonly oauthStates = new Map<string, number>();
+  private readonly frontendUrl: string;
   readonly enabled: boolean;
 
   constructor(
@@ -35,10 +43,14 @@ export class GoogleAuthService {
     private readonly jwt: JwtService,
     private readonly sessions: SessionsService,
     private readonly refreshTokens: RefreshTokenService,
+    private readonly cache: CacheService,
+    private readonly twoFactor: TwoFactorService,
     config: ConfigService,
   ) {
     this.clientId = config.get<string>('GOOGLE_CLIENT_ID');
     this.enabled = Boolean(this.clientId && config.get<string>('GOOGLE_CLIENT_SECRET'));
+    this.frontendUrl = config.get<string>('FRONTEND_URL', 'http://localhost:3001');
+
     if (!this.enabled) {
       this.logger.warn(
         'GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google authentication is disabled',
@@ -55,17 +67,54 @@ export class GoogleAuthService {
     }
   }
 
-  createOAuthState(): string {
+  // ------------------------------------------------------------------
+  // OAuth state — stored in Redis for multi-instance safety
+  // ------------------------------------------------------------------
+
+  async createOAuthState(): Promise<string> {
     const state = randomBytes(32).toString('hex');
-    this.oauthStates.set(state, Date.now() + 5 * 60 * 1000);
+    await this.cache.set(`google:oauth:state:${state}`, '1', OAUTH_STATE_TTL_SECONDS);
     return state;
   }
 
-  consumeOAuthState(state: string): boolean {
-    const expiresAt = this.oauthStates.get(state);
-    this.oauthStates.delete(state);
-    return Boolean(expiresAt && Date.now() <= expiresAt);
+  async consumeOAuthState(state: string): Promise<boolean> {
+    const key = `google:oauth:state:${state}`;
+    const exists = await this.cache.get<string>(key);
+    if (!exists) return false;
+    await this.cache.del(key);
+    return true;
   }
+
+  // ------------------------------------------------------------------
+  // One-time auth code — issued at callback, exchanged by the frontend
+  // ------------------------------------------------------------------
+
+  /**
+   * Store a short-lived one-time code that carries the full token pair.
+   * The frontend exchanges this code for tokens via a dedicated endpoint.
+   */
+  async createAuthCode(tokens: object): Promise<string> {
+    const code = randomBytes(32).toString('hex');
+    await this.cache.set(`google:auth:code:${code}`, tokens, AUTH_CODE_TTL_SECONDS);
+    return code;
+  }
+
+  async consumeAuthCode(code: string): Promise<object | null> {
+    const key = `google:auth:code:${code}`;
+    const tokens = await this.cache.get<object>(key);
+    if (!tokens) return null;
+    await this.cache.del(key);
+    return tokens;
+  }
+
+  /** Returns the FRONTEND_URL to redirect to after a successful OAuth callback. */
+  getFrontendCallbackUrl(code: string): string {
+    return `${this.frontendUrl}/auth/google/callback?code=${code}`;
+  }
+
+  // ------------------------------------------------------------------
+  // Token verification
+  // ------------------------------------------------------------------
 
   async verifyIdToken(idToken: string): Promise<GoogleIdentity> {
     this.assertEnabled();
@@ -96,6 +145,10 @@ export class GoogleAuthService {
     return this.login(await this.verifyIdToken(idToken), deviceMeta);
   }
 
+  // ------------------------------------------------------------------
+  // Login / account linking
+  // ------------------------------------------------------------------
+
   async login(identity: GoogleIdentity, deviceMeta?: DeviceMetadata) {
     if (!identity.emailVerified) {
       throw new UnauthorizedException('A verified Google email is required');
@@ -104,10 +157,37 @@ export class GoogleAuthService {
     const existingByGoogle = await this.prisma.user.findUnique({
       where: { googleId: identity.googleId },
     });
-    const existingByEmail = existingByGoogle
-      ? null
-      : await this.prisma.user.findUnique({ where: { email: identity.email } });
+
+    // When no account is linked to this Google ID yet, look up by e-mail.
+    // Only auto-link when the existing account's email has been verified by
+    // us — otherwise an attacker who sets a victim's e-mail on their own
+    // account can pre-hijack it before the victim signs in with Google.
+    let existingByEmail = null;
+    if (!existingByGoogle) {
+      const candidate = await this.prisma.user.findUnique({
+        where: { email: identity.email },
+      });
+      // isVerified is the platform-level email-verification flag.
+      if (candidate?.isVerified) {
+        existingByEmail = candidate;
+      }
+      // If the candidate exists but is NOT verified we deliberately ignore it
+      // to prevent pre-hijacking.
+    }
+
     const existing = existingByGoogle ?? existingByEmail;
+
+    // ---- Enforce 2FA for Google logins on 2FA-enabled accounts ----
+    if (existing?.twoFactorEnabled) {
+      // We cannot interactively prompt for a TOTP here during the OAuth redirect
+      // flow, so we reject with a clear error.  Clients using the ID-token
+      // endpoint (/auth/google/token) should pass totpCode alongside idToken.
+      // The controller layer must handle this case.
+      throw new UnauthorizedException(
+        'Two-factor authentication is enabled on this account. ' +
+        'Please use the token endpoint and supply your TOTP code.',
+      );
+    }
 
     try {
       const user = existing
@@ -145,6 +225,81 @@ export class GoogleAuthService {
       }
 
       // Issue #234 — never return the TOTP secret or recovery-code hashes
+      return { ...tokens, user: toSafeUser(user) };
+    } catch (error) {
+      if (error?.code === 'P2002') {
+        throw new ConflictException('Google account is already linked to another user');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Login with Google ID token + TOTP code for 2FA-enabled accounts.
+   */
+  async loginWithIdTokenAndTotp(
+    idToken: string,
+    totpCode: string,
+    deviceMeta?: DeviceMetadata,
+  ) {
+    const identity = await this.verifyIdToken(idToken);
+
+    if (!identity.emailVerified) {
+      throw new UnauthorizedException('A verified Google email is required');
+    }
+
+    const existingByGoogle = await this.prisma.user.findUnique({
+      where: { googleId: identity.googleId },
+    });
+
+    let existingByEmail = null;
+    if (!existingByGoogle) {
+      const candidate = await this.prisma.user.findUnique({
+        where: { email: identity.email },
+      });
+      if (candidate?.isVerified) {
+        existingByEmail = candidate;
+      }
+    }
+
+    const existing = existingByGoogle ?? existingByEmail;
+
+    if (!existing?.twoFactorEnabled) {
+      // Account does not have 2FA — fall through to the normal login path.
+      return this.login(identity, deviceMeta);
+    }
+
+    // Verify TOTP before linking / issuing tokens.
+    const isTotpValid = await this.twoFactor.verifyLoginCode(existing.id, totpCode);
+    if (!isTotpValid) {
+      throw new UnauthorizedException('Invalid two-factor authentication code');
+    }
+
+    try {
+      const user = await this.prisma.user.update({
+        where: { id: existing.id },
+        data: {
+          googleId: identity.googleId,
+          email: existing.email ?? identity.email,
+          name: existing.name ?? identity.name,
+          avatarUrl: existing.avatarUrl ?? identity.avatarUrl,
+        },
+      });
+
+      const tokens = await this.refreshTokens.issueTokenPair(user);
+      const decoded = this.jwt.decode(tokens.accessToken) as { exp?: number; jti?: string } | null;
+      if (decoded?.jti) {
+        const expiresAt = decoded.exp
+          ? new Date(decoded.exp * 1000)
+          : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        await this.sessions.createSession({
+          userId: user.id,
+          jti: decoded.jti,
+          expiresAt,
+          meta: deviceMeta,
+        });
+      }
+
       return { ...tokens, user: toSafeUser(user) };
     } catch (error) {
       if (error?.code === 'P2002') {
