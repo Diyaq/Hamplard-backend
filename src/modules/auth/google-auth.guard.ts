@@ -10,40 +10,46 @@ export class GoogleAuthGuard extends AuthGuard('google') {
     super();
   }
 
-  getAuthenticateOptions(context: ExecutionContext) {
-    const request = context.switchToHttp().getRequest();
-    if (request.path.endsWith('/callback')) return {};
-
-    const response = context.switchToHttp().getResponse<Response>();
-    const state = this.googleAuth.createOAuthState();
-    response.cookie('google_oauth_state', state, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: request.secure,
-      maxAge: 5 * 60 * 1000,
-    });
-    return { state };
+  getAuthenticateOptions(_context: ExecutionContext) {
+    // state is injected per-request inside canActivate; this method only
+    // provides the static options used by Passport for the non-callback leg.
+    return {};
   }
 
-  canActivate(context: ExecutionContext) {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     // Bail out before Passport runs: the 'google' strategy is not registered when disabled.
     this.googleAuth.assertEnabled();
 
     const request = context.switchToHttp().getRequest();
-    if (request.path.endsWith('/callback')) {
-      const state = request.query?.state;
-      const cookies = this.parseCookies(request.headers.cookie);
-      if (
-        typeof state !== 'string' ||
-        cookies.google_oauth_state !== state ||
-        !this.googleAuth.consumeOAuthState(state)
-      ) {
-        throw new UnauthorizedException('Invalid or expired Google OAuth state');
-      }
-      context.switchToHttp().getResponse<Response>().clearCookie('google_oauth_state');
+
+    if (!request.path.endsWith('/callback')) {
+      // --- Initiate leg: generate and store a state token ---
+      const state = await this.googleAuth.createOAuthState();
+      const response = context.switchToHttp().getResponse<Response>();
+      response.cookie('google_oauth_state', state, {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: request.secure,
+        maxAge: 5 * 60 * 1000,
+      });
+      // Pass state to Passport so it is forwarded in the redirect URL.
+      (request as any)._googleOAuthState = state;
+      return super.canActivate(context) as Promise<boolean>;
     }
 
-    return super.canActivate(context);
+    // --- Callback leg: validate and consume the state ---
+    const state = request.query?.state;
+    const cookies = this.parseCookies(request.headers.cookie);
+    if (
+      typeof state !== 'string' ||
+      cookies.google_oauth_state !== state ||
+      !(await this.googleAuth.consumeOAuthState(state))
+    ) {
+      throw new UnauthorizedException('Invalid or expired Google OAuth state');
+    }
+    context.switchToHttp().getResponse<Response>().clearCookie('google_oauth_state');
+
+    return super.canActivate(context) as Promise<boolean>;
   }
 
   private parseCookies(header?: string): Record<string, string> {

@@ -63,7 +63,7 @@ export class AuthController {
   ) {
     const ip = req.ip || req.socket?.remoteAddress || 'unknown';
     await this.captchaService.verifyBeforeNonce(captchaToken || captchaHeader, ip);
-    return { nonce: this.authService.generateNonce(address), address };
+    return { nonce: await this.authService.generateNonce(address), address };
   }
 
   @Post('login')

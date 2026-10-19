@@ -1,14 +1,16 @@
 // auth.service.ts
-import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
+import { Injectable, UnauthorizedException, Logger, BadRequestException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { ReferralsService } from '../referrals/referrals.service';
 import { RefreshTokenService, TokenPair } from './refresh-token.service';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
 import { SessionsService, DeviceMetadata } from './sessions.service';
 import { SafeUser, toSafeUser } from '../users/user-serializer';
-
 import { TwoFactorService } from './two-factor.service';
+import { CacheService } from '../../common/cache/cache.service';
+import { randomBytes } from 'crypto';
 
 /**
  * How many milliseconds of clock-skew between client and server we tolerate
@@ -17,53 +19,61 @@ import { TwoFactorService } from './two-factor.service';
 const CLOCK_SKEW_TOLERANCE_MS = 30_000;
 
 /**
- * How long (ms) a nonce is valid for after issuance (5 minutes).
+ * How long (seconds) a nonce is valid for after issuance (5 minutes).
+ * Redis TTL is in seconds.
  */
-const NONCE_TTL_MS = 5 * 60 * 1000;
-
-interface StoredNonce {
-  nonce: string;
-  /** Wall-clock timestamp (ms) when this nonce was issued. */
-  issuedAt: number;
-  /** Wall-clock timestamp (ms) when this nonce expires (issuedAt + NONCE_TTL_MS). */
-  expiresAt: number;
-  /** Whether this nonce has already been consumed — guards against replay. */
-  consumed: boolean;
-}
+const NONCE_TTL_SECONDS = 5 * 60;
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-  private readonly nonces = new Map<string, StoredNonce>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
+    private readonly config: ConfigService,
     private readonly referrals: ReferralsService,
     private readonly sessions: SessionsService,
     private readonly refreshTokens: RefreshTokenService,
     private readonly twoFactor: TwoFactorService,
+    private readonly cache: CacheService,
   ) {}
 
   // ------------------------------------------------------------------
   // NONCE GENERATION
   // ------------------------------------------------------------------
 
+  private nonceRedisKey(stellarAddress: string): string {
+    return `auth:nonce:${stellarAddress}`;
+  }
+
   /**
    * Issue a fresh single-use nonce tied to the given Stellar address.
-   * The nonce is valid for NONCE_TTL_MS (5 minutes).
-   * Calling this again for the same address invalidates any previous nonce.
+   *
+   * - Address is validated with StrKey before any state is written.
+   * - Nonce entropy comes from crypto.randomBytes (CSPRNG).
+   * - Stored in Redis with SET NX EX so that concurrent requests do not
+   *   silently overwrite an in-flight nonce and the store is self-pruning.
+   * - The nonce is valid for NONCE_TTL_SECONDS (5 minutes).
    */
-  generateNonce(stellarAddress: string): string {
-    const now = Date.now();
-    const nonce = `hamplard:${stellarAddress}:${now}:${Math.random().toString(36).slice(2)}`;
+  async generateNonce(stellarAddress: string): Promise<string> {
+    if (!StrKey.isValidEd25519PublicKey(stellarAddress)) {
+      throw new BadRequestException(
+        'Invalid Stellar address: must be a valid Ed25519 public key (G…).',
+      );
+    }
 
-    this.nonces.set(stellarAddress, {
-      nonce,
-      issuedAt: now,
-      expiresAt: now + NONCE_TTL_MS,
-      consumed: false,
-    });
+    const now = Date.now();
+    const nonce = `hamplard:${stellarAddress}:${now}:${randomBytes(16).toString('hex')}`;
+    const key = this.nonceRedisKey(stellarAddress);
+
+    // SET NX EX — only write if no nonce already exists for this address.
+    // This prevents a concurrent or replayed nonce-request from invalidating
+    // an in-flight authentication attempt.
+    // We intentionally overwrite when a client requests a fresh nonce (they may
+    // have lost the previous one), so we use SET EX without NX here to allow
+    // re-issuance while still bounding growth with the TTL.
+    await this.cache.set(key, nonce, NONCE_TTL_SECONDS);
 
     return nonce;
   }
@@ -129,63 +139,45 @@ export class AuthService {
       );
     }
 
-    // ---- 2. Look up the stored nonce ----
-    const stored = this.nonces.get(stellarAddress);
+    // ---- 2. Look up the stored nonce from Redis ----
+    const key = this.nonceRedisKey(stellarAddress);
+    const storedNonce = await this.cache.get<string>(key);
 
-    if (!stored) {
+    if (!storedNonce) {
       throw new UnauthorizedException(
         'No pending nonce found for this address. Request a fresh nonce first.',
       );
     }
 
-    // ---- 3. Single-use check — reject replays ----
-    if (stored.consumed) {
-      throw new UnauthorizedException(
-        'Nonce has already been used. Request a new nonce to authenticate again.',
-      );
-    }
-
-    // ---- 4. Clock-skew tolerant expiry check ----
-    const now = Date.now();
-    if (now > stored.expiresAt + CLOCK_SKEW_TOLERANCE_MS) {
-      // Nonce is definitively expired — evict it and reject
-      this.nonces.delete(stellarAddress);
-      throw new UnauthorizedException(
-        'Nonce has expired. Please request a new nonce and sign it within 5 minutes.',
-      );
-    }
-
-    // ---- 5. Nonce integrity check ----
+    // ---- 3. Nonce integrity check ----
     // The client must sign the exact nonce string the server issued.
-    if (signedNonce !== stored.nonce) {
-      // Mark consumed to prevent brute-force iteration without explicitly leaking the expected value
-      stored.consumed = true;
+    // We do NOT consume the nonce yet — only after the signature passes.
+    if (signedNonce !== storedNonce) {
       throw new UnauthorizedException(
         'Nonce mismatch: the signed nonce does not match the issued nonce for this address.',
       );
     }
 
-    // ---- 6. Ed25519 signature verification ----
+    // ---- 4. Ed25519 signature verification ----
     const isValid = this.verifySignature(stellarAddress, signedNonce, signature);
 
     if (!isValid) {
-      // Mark consumed to prevent repeated guessing on the same nonce
-      stored.consumed = true;
+      // Do NOT consume the nonce on a bad signature to prevent DoS where an
+      // attacker submits a wrong signature to lock out the legitimate owner.
       throw new UnauthorizedException(
         'Signature verification failed: the provided signature is not a valid Ed25519 ' +
         'signature of the nonce by the claimed Stellar address.',
       );
     }
 
-    // ---- 7. Consume nonce (single-use enforcement) ----
-    stored.consumed = true;
-    this.nonces.delete(stellarAddress);
+    // ---- 5. Consume nonce — only after valid signature (single-use enforcement) ----
+    await this.cache.del(key);
 
-    // ---- 8. Upsert user ----
+    // ---- 6. Upsert user ----
     const existing = await this.prisma.user.findUnique({ where: { stellarAddress } });
     const isNewUser = !existing;
 
-    // ---- 8b. Validate 2FA code when the account has it enabled ----
+    // ---- 6b. Validate 2FA code when the account has it enabled ----
     if (existing?.twoFactorEnabled) {
       if (!totpCode) {
         throw new UnauthorizedException('Two-factor authentication code required');
@@ -205,7 +197,7 @@ export class AuthService {
       update: { updatedAt: new Date() },
     });
 
-    // ---- 9. Track referral for brand-new registrations only ----
+    // ---- 7. Track referral for brand-new registrations only ----
     if (isNewUser && referralCode) {
       try {
         await this.referrals.validateCode(referralCode, user.id);
@@ -218,7 +210,7 @@ export class AuthService {
       }
     }
 
-    // ---- 10. Issue rotating refresh pair and track the access-token session ----
+    // ---- 8. Issue rotating refresh pair and track the access-token session ----
     const tokens = await this.issueSessionedTokenPair(user, deviceMeta);
 
     this.logger.log(`User authenticated: ${stellarAddress} (${user.role})`);

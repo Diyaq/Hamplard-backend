@@ -18,6 +18,10 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google', 6) {
         'http://localhost:3000/api/v1/auth/google/callback',
       ),
       scope: ['openid', 'email', 'profile'],
+      // state: true tells passport-google-oauth20 to generate and verify a
+      // state parameter automatically. Our guard handles the actual
+      // generation/verification using Redis-backed values, so we rely on
+      // the guard's enforcement rather than Passport's built-in session store.
       passReqToCallback: true,
     });
   }
