@@ -3,10 +3,17 @@ import {
   BadRequestException, ForbiddenException, Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
-import { DiscountType } from '@prisma/client';
+import { Coupon, DiscountType, EnrollmentStatus, Prisma, UserRole } from '@prisma/client';
 import { CreateCouponDto } from './dto/create-coupon.dto';
 import { UpdateCouponDto } from './dto/update-coupon.dto';
 import { ValidateCouponDto } from './dto/validate-coupon.dto';
+import { RedeemCouponDto } from './dto/redeem-coupon.dto';
+
+/** The authenticated user acting on a coupon. */
+export interface CouponActor {
+  id: string;
+  role: UserRole | string;
+}
 
 @Injectable()
 export class CouponsService {
@@ -18,7 +25,8 @@ export class CouponsService {
   // CREATE
   // ----------------------------------------------------------
 
-  async create(userId: string, dto: CreateCouponDto) {
+  async create(actor: CouponActor, dto: CreateCouponDto) {
+    const userId = actor.id;
     const code = dto.code.toUpperCase().trim();
 
     // Validate discountValue is positive
@@ -50,11 +58,8 @@ export class CouponsService {
     const existing = await this.prisma.coupon.findUnique({ where: { code } });
     if (existing) throw new ConflictException(`Coupon code "${code}" already exists`);
 
-    // Validate courseId if provided
-    if (dto.courseId) {
-      const course = await this.prisma.course.findUnique({ where: { id: dto.courseId } });
-      if (!course) throw new NotFoundException(`Course ${dto.courseId} not found`);
-    }
+    // Validate courseId (instructors must scope coupons to a course they own)
+    await this.assertCanScopeToCourse(actor, dto.courseId);
 
     const coupon = await this.prisma.coupon.create({
       data: {
@@ -82,9 +87,11 @@ export class CouponsService {
   // READ
   // ----------------------------------------------------------
 
-  async findAll(page = 1, limit = 20, isActive?: boolean) {
+  async findAll(actor: CouponActor, page = 1, limit = 20, isActive?: boolean) {
     const where: any = {};
     if (isActive !== undefined) where.isActive = isActive;
+    // Instructors only see coupons they created
+    if (!this.isAdmin(actor)) where.createdById = actor.id;
 
     const [coupons, total] = await this.prisma.$transaction([
       this.prisma.coupon.findMany({
@@ -104,7 +111,7 @@ export class CouponsService {
     return { data: coupons, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
   }
 
-  async findOne(id: string) {
+  async findOne(id: string, actor?: CouponActor) {
     const coupon = await this.prisma.coupon.findUnique({
       where: { id },
       include: {
@@ -114,6 +121,7 @@ export class CouponsService {
       },
     });
     if (!coupon) throw new NotFoundException(`Coupon ${id} not found`);
+    if (actor) this.assertCanManage(coupon, actor);
     return coupon;
   }
 
@@ -129,8 +137,13 @@ export class CouponsService {
   // UPDATE / DEACTIVATE
   // ----------------------------------------------------------
 
-  async update(id: string, dto: UpdateCouponDto) {
-    const existing = await this.findOne(id);
+  async update(id: string, dto: UpdateCouponDto, actor: CouponActor) {
+    const existing = await this.findOne(id, actor);
+
+    // Re-scoping the coupon follows the same ownership rules as creation
+    if (dto.courseId !== undefined) {
+      await this.assertCanScopeToCourse(actor, dto.courseId);
+    }
 
     const discountType = dto.discountType ?? existing.discountType;
     const discountValue = dto.discountValue ?? Number(existing.discountValue);
@@ -165,8 +178,8 @@ export class CouponsService {
     });
   }
 
-  async deactivate(id: string) {
-    await this.findOne(id);
+  async deactivate(id: string, actor: CouponActor) {
+    await this.findOne(id, actor);
     return this.prisma.coupon.update({ where: { id }, data: { isActive: false } });
   }
 
@@ -177,52 +190,32 @@ export class CouponsService {
   /**
    * Validates a coupon code for a specific course and user,
    * returning the discounted price if valid.
-   * Does NOT record the redemption — call redeemCoupon() at purchase time.
+   * The course price is always looked up server-side; any client-supplied
+   * price is ignored. Does NOT record the redemption — call redeem() at purchase time.
    */
   async validate(userId: string, dto: ValidateCouponDto) {
     const code = dto.code.toUpperCase().trim();
     const coupon = await this.prisma.coupon.findUnique({ where: { code } });
-
     if (!coupon) throw new NotFoundException(`Coupon code "${dto.code}" not found`);
-    if (!coupon.isActive) throw new BadRequestException('This coupon is no longer active');
 
-    // Check expiry
-    if (coupon.expiresAt && coupon.expiresAt < new Date()) {
-      throw new BadRequestException('This coupon has expired');
-    }
+    const course = await this.prisma.course.findUnique({
+      where: { id: dto.courseId },
+      select: { id: true, price: true },
+    });
+    if (!course) throw new NotFoundException(`Course ${dto.courseId} not found`);
 
-    // Check usage limits
-    if (coupon.maxRedemptions !== null && coupon.redeemedCount >= coupon.maxRedemptions) {
-      throw new BadRequestException('This coupon has reached its usage limit');
-    }
-
-    // Check course restriction
-    if (coupon.courseId && coupon.courseId !== dto.courseId) {
-      throw new ForbiddenException('This coupon is not valid for the selected course');
-    }
-
-    // Check minimum order amount
-    if (coupon.minOrderAmount !== null && dto.originalPrice < Number(coupon.minOrderAmount)) {
-      throw new BadRequestException(
-        `This coupon requires a minimum order of ${coupon.minOrderAmount} USDC`,
-      );
-    }
+    const originalPrice = Number(course.price);
+    this.assertCouponUsable(coupon, course.id, originalPrice);
 
     // Check if user already redeemed this coupon for this course
     const alreadyRedeemed = await this.prisma.couponRedemption.findUnique({
-      where: { couponId_userId_courseId: { couponId: coupon.id, userId, courseId: dto.courseId } },
+      where: { couponId_userId_courseId: { couponId: coupon.id, userId, courseId: course.id } },
     });
     if (alreadyRedeemed) {
       throw new ConflictException('You have already used this coupon for this course');
     }
 
-    // Calculate discount
-    const discountAmount = this.calculateDiscount(
-      coupon.discountType,
-      Number(coupon.discountValue),
-      dto.originalPrice,
-    );
-    const finalPrice = Math.max(0, dto.originalPrice - discountAmount);
+    const { discountAmount, finalPrice } = this.priceWithDiscount(coupon, originalPrice);
 
     return {
       valid: true,
@@ -230,9 +223,9 @@ export class CouponsService {
       code: coupon.code,
       discountType: coupon.discountType,
       discountValue: Number(coupon.discountValue),
-      discountAmount: Number(discountAmount.toFixed(2)),
-      originalPrice: dto.originalPrice,
-      finalPrice: Number(finalPrice.toFixed(2)),
+      discountAmount,
+      originalPrice,
+      finalPrice,
       expiresAt: coupon.expiresAt,
       remainingRedemptions:
         coupon.maxRedemptions !== null ? coupon.maxRedemptions - coupon.redeemedCount : null,
@@ -243,27 +236,88 @@ export class CouponsService {
   // REDEEM (called after successful checkout)
   // ----------------------------------------------------------
 
-  async redeem(userId: string, couponId: string, courseId: string, discountAmount: number) {
-    const coupon = await this.prisma.coupon.findUnique({ where: { id: couponId } });
-    if (!coupon) throw new NotFoundException('Coupon not found');
-
-    return this.prisma.$transaction(async (tx) => {
-      await tx.couponRedemption.create({
-        data: { couponId, userId, courseId, discount: discountAmount },
-      });
-      await tx.coupon.update({
-        where: { id: couponId },
-        data: { redeemedCount: { increment: 1 } },
-      });
+  /**
+   * Records a coupon redemption against one of the caller's verified enrollments.
+   * The course and discount are derived server-side, every validity check is
+   * re-run inside the transaction, and the redemption counter is bumped with a
+   * conditional update so concurrent redemptions can never exceed maxRedemptions.
+   */
+  async redeem(userId: string, dto: RedeemCouponDto) {
+    const enrollment = await this.prisma.enrollment.findUnique({
+      where: { id: dto.enrollmentId },
+      select: {
+        id: true,
+        studentId: true,
+        courseId: true,
+        status: true,
+        course: { select: { id: true, price: true } },
+      },
     });
+    if (
+      !enrollment
+      || enrollment.studentId !== userId
+      || (enrollment.status !== EnrollmentStatus.ACTIVE
+        && enrollment.status !== EnrollmentStatus.COMPLETED)
+    ) {
+      throw new ForbiddenException('A verified enrollment is required to redeem a coupon');
+    }
+
+    const courseId = enrollment.courseId;
+    const originalPrice = Number(enrollment.course.price);
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const coupon = await tx.coupon.findUnique({ where: { id: dto.couponId } });
+        if (!coupon) throw new NotFoundException('Coupon not found');
+
+        this.assertCouponUsable(coupon, courseId, originalPrice);
+
+        const now = new Date();
+        const { count } = await tx.coupon.updateMany({
+          where: {
+            id: coupon.id,
+            isActive: true,
+            AND: [
+              { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+              coupon.maxRedemptions !== null
+                ? { redeemedCount: { lt: coupon.maxRedemptions } }
+                : {},
+            ],
+          },
+          data: { redeemedCount: { increment: 1 } },
+        });
+        if (count !== 1) {
+          throw new BadRequestException('This coupon has reached its usage limit');
+        }
+
+        const { discountAmount, finalPrice } = this.priceWithDiscount(coupon, originalPrice);
+
+        const redemption = await tx.couponRedemption.create({
+          data: { couponId: coupon.id, userId, courseId, discount: discountAmount },
+        });
+
+        return {
+          ...redemption,
+          enrollmentId: enrollment.id,
+          originalPrice,
+          discountAmount,
+          finalPrice,
+        };
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('You have already used this coupon for this course');
+      }
+      throw error;
+    }
   }
 
   // ----------------------------------------------------------
   // REDEMPTION HISTORY
   // ----------------------------------------------------------
 
-  async getRedemptions(couponId: string, page = 1, limit = 20) {
-    await this.findOne(couponId);
+  async getRedemptions(couponId: string, actor: CouponActor, page = 1, limit = 20) {
+    await this.findOne(couponId, actor);
 
     const [redemptions, total] = await this.prisma.$transaction([
       this.prisma.couponRedemption.findMany({
@@ -284,6 +338,77 @@ export class CouponsService {
   // ----------------------------------------------------------
   // HELPERS
   // ----------------------------------------------------------
+
+  private isAdmin(actor: CouponActor) {
+    return actor.role === UserRole.ADMIN;
+  }
+
+  /** Only the coupon's creator or an admin may view or manage it. */
+  private assertCanManage(coupon: { createdById: string }, actor: CouponActor) {
+    if (!this.isAdmin(actor) && coupon.createdById !== actor.id) {
+      throw new ForbiddenException('You can only manage coupons you created');
+    }
+  }
+
+  /**
+   * Admins may create platform-wide coupons or scope them to any course.
+   * Everyone else must scope the coupon to a course they own.
+   */
+  private async assertCanScopeToCourse(actor: CouponActor, courseId: string | null | undefined) {
+    if (!courseId) {
+      if (!this.isAdmin(actor)) {
+        throw new ForbiddenException('Instructors must scope coupons to a course they own');
+      }
+      return;
+    }
+
+    const course = await this.prisma.course.findUnique({
+      where: { id: courseId },
+      select: { id: true, instructor: { select: { id: true } } },
+    });
+    if (!course) throw new NotFoundException(`Course ${courseId} not found`);
+
+    // course.instructorAddress is a Stellar address, so compare by user id
+    if (!this.isAdmin(actor) && course.instructor?.id !== actor.id) {
+      throw new ForbiddenException('You can only create coupons for courses you own');
+    }
+  }
+
+  /** Throws if the coupon cannot be applied to the given course at the given server-side price. */
+  private assertCouponUsable(coupon: Coupon, courseId: string, originalPrice: number) {
+    if (!coupon.isActive) throw new BadRequestException('This coupon is no longer active');
+
+    if (coupon.expiresAt && coupon.expiresAt < new Date()) {
+      throw new BadRequestException('This coupon has expired');
+    }
+
+    if (coupon.maxRedemptions !== null && coupon.redeemedCount >= coupon.maxRedemptions) {
+      throw new BadRequestException('This coupon has reached its usage limit');
+    }
+
+    if (coupon.courseId && coupon.courseId !== courseId) {
+      throw new ForbiddenException('This coupon is not valid for the selected course');
+    }
+
+    if (coupon.minOrderAmount !== null && originalPrice < Number(coupon.minOrderAmount)) {
+      throw new BadRequestException(
+        `This coupon requires a minimum order of ${coupon.minOrderAmount} USDC`,
+      );
+    }
+  }
+
+  private priceWithDiscount(coupon: Coupon, originalPrice: number) {
+    const discountAmount = this.calculateDiscount(
+      coupon.discountType,
+      Number(coupon.discountValue),
+      originalPrice,
+    );
+    const finalPrice = Math.max(0, originalPrice - discountAmount);
+    return {
+      discountAmount: Number(discountAmount.toFixed(2)),
+      finalPrice: Number(finalPrice.toFixed(2)),
+    };
+  }
 
   private calculateDiscount(
     type: DiscountType,

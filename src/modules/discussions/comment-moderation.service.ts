@@ -1,8 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { ReviewCommentDto } from './dto/review-comment.dto';
-import { CommentReviewStatus } from '@prisma/client';
+import { CommentReviewStatus, EnrollmentStatus, UserRole } from '@prisma/client';
 import Filter from 'bad-words';
 
 @Injectable()
@@ -18,6 +23,14 @@ export class CommentModerationService {
     'buy now',
     'cancel subscription',
   ];
+  // Whole-word patterns so innocent words like "scampi" or "fakes" are not flagged
+  private readonly bannedTermPatterns = this.bannedTerms.map((term) => ({
+    term,
+    pattern: new RegExp(
+      `\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')}\\b`,
+      'i',
+    ),
+  }));
   private readonly autoHideThreshold = 1;
 
   constructor(private readonly prisma: PrismaService) {
@@ -25,10 +38,9 @@ export class CommentModerationService {
   }
 
   private scanContent(content: string) {
-    const lowerContent = content.toLowerCase();
-    const matchedTerms = this.bannedTerms.filter((term) =>
-      lowerContent.includes(term),
-    );
+    const matchedTerms = this.bannedTermPatterns
+      .filter(({ pattern }) => pattern.test(content))
+      .map(({ term }) => term);
     const hasProfanity = this.filter.isProfane(content);
     const reasons = new Set<string>(matchedTerms);
 
@@ -42,7 +54,39 @@ export class CommentModerationService {
     };
   }
 
-  async createComment(authorId: string, dto: CreateCommentDto) {
+  /**
+   * A discussion thread belongs to a course: `discussionId` is the course ID.
+   * Only enrolled students, the course instructor or an admin may comment.
+   */
+  private async assertCanComment(authorId: string, role: UserRole | undefined, discussionId: string) {
+    const course = await this.prisma.course.findUnique({
+      where: { id: discussionId },
+      select: { id: true, instructor: { select: { id: true } } },
+    });
+    if (!course) {
+      throw new NotFoundException(`Discussion ${discussionId} not found`);
+    }
+
+    if (role === UserRole.ADMIN || course.instructor?.id === authorId) {
+      return;
+    }
+
+    const enrollment = await this.prisma.enrollment.findUnique({
+      where: { studentId_courseId: { studentId: authorId, courseId: discussionId } },
+      select: { status: true },
+    });
+    if (
+      !enrollment
+      || (enrollment.status !== EnrollmentStatus.ACTIVE
+        && enrollment.status !== EnrollmentStatus.COMPLETED)
+    ) {
+      throw new ForbiddenException('You must be enrolled in this course to join its discussion');
+    }
+  }
+
+  async createComment(authorId: string, dto: CreateCommentDto, role?: UserRole) {
+    await this.assertCanComment(authorId, role, dto.discussionId);
+
     const scan = this.scanContent(dto.content);
     const flaggedCount = scan.isFlagged ? 1 : 0;
     const hidden = scan.isFlagged && flaggedCount >= this.autoHideThreshold;
@@ -68,13 +112,29 @@ export class CommentModerationService {
       where: {
         discussionId,
         hidden: false,
+        reviewStatus: { not: CommentReviewStatus.REJECTED },
       },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async findCommentById(id: string) {
-    return this.prisma.discussionComment.findUnique({ where: { id } });
+  async findCommentById(id: string, viewerRole?: UserRole | null) {
+    const comment = await this.prisma.discussionComment.findUnique({ where: { id } });
+    if (!comment) {
+      throw new NotFoundException(`Comment ${id} not found`);
+    }
+
+    if (viewerRole === UserRole.ADMIN) {
+      return comment;
+    }
+
+    // Hidden or rejected comments are invisible to everyone but admins
+    if (comment.hidden || comment.reviewStatus === CommentReviewStatus.REJECTED) {
+      throw new NotFoundException(`Comment ${id} not found`);
+    }
+
+    const { moderationNotes: _moderationNotes, ...publicComment } = comment;
+    return publicComment;
   }
 
   async findFlaggedComments() {

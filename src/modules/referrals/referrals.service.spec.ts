@@ -234,74 +234,115 @@ describe('ReferralsService', () => {
       expect(mockPrisma.$transaction).not.toHaveBeenCalled();
     });
 
-    it('converts referral and issues referrer reward under the rules', async () => {
-      mockPrisma.referral.findUnique.mockResolvedValue({
-        id: 'ref-1',
-        status: ReferralStatus.SIGNED_UP,
-        referrerId: 'referrer-1',
-        referralCodeId: 'rc-1',
-        rewards: [],
-      });
-      mockPrisma.referralReward.count.mockResolvedValue(0);
+    const signedUpReferral = {
+      id: 'ref-1',
+      status: ReferralStatus.SIGNED_UP,
+      referrerId: 'referrer-1',
+      referralCodeId: 'rc-1',
+      rewards: [],
+    };
 
-      const updated = {
-        id: 'ref-1',
-        status: ReferralStatus.CONVERTED,
-        enrollmentId: 'enr-1',
+    /**
+     * Builds an in-memory transaction client backed by shared state so the
+     * conditional `updateMany` behaves like the database would under contention.
+     */
+    const buildTxState = (existingRewardCount = 0) => {
+      const state = {
+        status: ReferralStatus.SIGNED_UP as ReferralStatus,
+        enrollmentId: null as string | null,
+        totalConversions: 0,
+        rewards: [] as any[],
       };
 
-      mockPrisma.$transaction.mockImplementation(async (cb: any) =>
-        cb({
-          referral: {
-            update: jest.fn().mockResolvedValue(updated),
-          },
-          referralCode: {
-            update: jest.fn().mockResolvedValue({}),
-          },
-          referralReward: {
-            create: jest.fn().mockResolvedValue({}),
-          },
-        }),
-      );
+      const tx = {
+        referral: {
+          updateMany: jest.fn(async ({ where, data }: any) => {
+            if (state.status !== where.status) return { count: 0 };
+            state.status = data.status;
+            state.enrollmentId = data.enrollmentId;
+            return { count: 1 };
+          }),
+          findUnique: jest.fn(async () => ({
+            id: 'ref-1',
+            status: state.status,
+            enrollmentId: state.enrollmentId,
+          })),
+        },
+        referralCode: {
+          update: jest.fn(async () => {
+            state.totalConversions += 1;
+            return {};
+          }),
+        },
+        referralReward: {
+          count: jest.fn(async () => existingRewardCount + state.rewards.length),
+          create: jest.fn(async ({ data }: any) => {
+            state.rewards.push(data);
+            return data;
+          }),
+        },
+      };
+
+      mockPrisma.$transaction.mockImplementation(async (cb: any) => cb(tx));
+      return { state, tx };
+    };
+
+    it('converts referral and issues referrer reward under the rules', async () => {
+      mockPrisma.referral.findUnique.mockResolvedValue(signedUpReferral);
+      const { state, tx } = buildTxState(0);
       mockNotifications.notifyUser.mockResolvedValue(undefined);
 
       const result = await service.trackConversion('new-user', 'enr-1');
 
       expect(result.status).toBe(ReferralStatus.CONVERTED);
+      expect(tx.referral.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'ref-1', status: ReferralStatus.SIGNED_UP },
+        }),
+      );
+      expect(state.rewards).toHaveLength(1);
+      expect(state.totalConversions).toBe(1);
       expect(mockNotifications.notifyUser).toHaveBeenCalled();
     });
 
     it('skips referrer reward when max rewards per referrer is reached', async () => {
-      mockPrisma.referral.findUnique.mockResolvedValue({
-        id: 'ref-1',
-        status: ReferralStatus.SIGNED_UP,
-        referrerId: 'referrer-1',
-        referralCodeId: 'rc-1',
-        rewards: [],
-      });
-      mockPrisma.referralReward.count.mockResolvedValue(50);
-
-      const rewardCreate = jest.fn();
-      mockPrisma.$transaction.mockImplementation(async (cb: any) =>
-        cb({
-          referral: {
-            update: jest.fn().mockResolvedValue({
-              id: 'ref-1',
-              status: ReferralStatus.CONVERTED,
-            }),
-          },
-          referralCode: {
-            update: jest.fn().mockResolvedValue({}),
-          },
-          referralReward: {
-            create: rewardCreate,
-          },
-        }),
-      );
+      mockPrisma.referral.findUnique.mockResolvedValue(signedUpReferral);
+      const { tx } = buildTxState(50);
 
       await service.trackConversion('new-user', 'enr-1');
-      expect(rewardCreate).not.toHaveBeenCalled();
+      expect(tx.referralReward.count).toHaveBeenCalled();
+      expect(tx.referralReward.create).not.toHaveBeenCalled();
       expect(mockNotifications.notifyUser).not.toHaveBeenCalled();
+    });
+
+    it('does not issue a reward when the conditional update affects no rows', async () => {
+      mockPrisma.referral.findUnique.mockResolvedValue(signedUpReferral);
+      const { state, tx } = buildTxState(0);
+      state.status = ReferralStatus.CONVERTED;
+
+      const result = await service.trackConversion('new-user', 'enr-1');
+
+      expect(result.status).toBe(ReferralStatus.CONVERTED);
+      expect(tx.referralCode.update).not.toHaveBeenCalled();
+      expect(tx.referralReward.create).not.toHaveBeenCalled();
+      expect(mockNotifications.notifyUser).not.toHaveBeenCalled();
+    });
+
+    it('issues exactly one referrer reward for parallel conversions', async () => {
+      // Both callers read SIGNED_UP before either transaction runs
+      mockPrisma.referral.findUnique.mockResolvedValue(signedUpReferral);
+      const { state } = buildTxState(0);
+      mockNotifications.notifyUser.mockResolvedValue(undefined);
+
+      await Promise.all([
+        service.trackConversion('new-user', 'enr-1'),
+        service.trackConversion('new-user', 'enr-2'),
+        service.trackConversion('new-user', 'enr-3'),
+      ]);
+
+      expect(state.rewards).toHaveLength(1);
+      expect(state.totalConversions).toBe(1);
+      expect(mockNotifications.notifyUser).toHaveBeenCalledTimes(1);
     });
   });
 

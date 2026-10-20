@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsNumber, IsPositive } from 'class-validator';
+import { IsString, IsNotEmpty, IsNumber, IsPositive, IsOptional } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class ValidateCouponDto {
@@ -12,8 +12,14 @@ export class ValidateCouponDto {
   @IsNotEmpty()
   courseId: string;
 
-  @ApiProperty({ example: 50, description: 'Original price of the course in USDC' })
+  @ApiProperty({
+    required: false,
+    deprecated: true,
+    example: 50,
+    description: 'Ignored — the course price is always looked up server-side',
+  })
+  @IsOptional()
   @IsNumber()
   @IsPositive()
-  originalPrice: number;
+  originalPrice?: number;
 }

@@ -266,30 +266,19 @@ export class ReferralsService {
     // Not referred — nothing to do
     if (!referral) return null;
 
-    // Already converted — idempotent
+    // Already converted — idempotent fast path
     if (referral.status === ReferralStatus.CONVERTED) {
       return referral;
     }
 
     const rules = await this.getRewardRules();
-
-    const referrerRewardCount = await this.prisma.referralReward.count({
-      where: {
-        beneficiaryId: referral.referrerId,
-        kind: ReferralRewardKind.REFERRER,
-        status: { in: [ReferralRewardStatus.ISSUED, ReferralRewardStatus.REDEEMED] },
-      },
-    });
-
-    const canIssueReferrerReward =
-      rules.referrerDiscountPercent > 0
-      && referrerRewardCount < rules.maxRewardsPerReferrer;
-
     const expiresAt = this.expiryDate(rules.rewardExpiryDays);
 
-    const updated = await this.prisma.$transaction(async (tx) => {
-      const converted = await tx.referral.update({
-        where: { id: referral.id },
+    const outcome = await this.prisma.$transaction(async (tx) => {
+      // Issue #289 — conditional update so only one concurrent caller can
+      // flip SIGNED_UP -> CONVERTED. Everyone else sees count === 0.
+      const { count } = await tx.referral.updateMany({
+        where: { id: referral.id, status: ReferralStatus.SIGNED_UP },
         data: {
           status: ReferralStatus.CONVERTED,
           convertedAt: new Date(),
@@ -297,12 +286,29 @@ export class ReferralsService {
         },
       });
 
+      if (count !== 1) {
+        const current = await tx.referral.findUnique({ where: { id: referral.id } });
+        return { converted: false, rewardIssued: false, referral: current };
+      }
+
       await tx.referralCode.update({
         where: { id: referral.referralCodeId },
         data: { totalConversions: { increment: 1 } },
       });
 
-      if (canIssueReferrerReward) {
+      const referrerRewardCount = await tx.referralReward.count({
+        where: {
+          beneficiaryId: referral.referrerId,
+          kind: ReferralRewardKind.REFERRER,
+          status: { in: [ReferralRewardStatus.ISSUED, ReferralRewardStatus.REDEEMED] },
+        },
+      });
+
+      const rewardIssued =
+        rules.referrerDiscountPercent > 0
+        && referrerRewardCount < rules.maxRewardsPerReferrer;
+
+      if (rewardIssued) {
         await tx.referralReward.create({
           data: {
             referralId: referral.id,
@@ -317,10 +323,16 @@ export class ReferralsService {
         });
       }
 
-      return converted;
+      const converted = await tx.referral.findUnique({ where: { id: referral.id } });
+      return { converted: true, rewardIssued, referral: converted };
     });
 
-    if (canIssueReferrerReward) {
+    // Lost the race to a concurrent conversion — nothing else to do
+    if (!outcome.converted) {
+      return outcome.referral;
+    }
+
+    if (outcome.rewardIssued) {
       try {
         await this.notifications.notifyUser(
           referral.referrerId,
@@ -335,9 +347,9 @@ export class ReferralsService {
     }
 
     this.logger.log(
-      `Referral converted: referred=${referredUserId} enrollment=${enrollmentId} rewardIssued=${canIssueReferrerReward}`,
+      `Referral converted: referred=${referredUserId} enrollment=${enrollmentId} rewardIssued=${outcome.rewardIssued}`,
     );
-    return updated;
+    return outcome.referral;
   }
 
   // ----------------------------------------------------------

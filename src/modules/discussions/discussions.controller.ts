@@ -14,6 +14,7 @@ import { CommentModerationService } from './comment-moderation.service';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { ReviewCommentDto } from './dto/review-comment.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../../common/guards/optional-jwt-auth.guard';
 import { RolesGuard, Roles } from '../../common/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '@prisma/client';
@@ -30,9 +31,10 @@ export class DiscussionsController {
   @HttpCode(HttpStatus.CREATED)
   createComment(
     @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: UserRole,
     @Body() dto: CreateCommentDto,
   ) {
-    return this.commentModerationService.createComment(userId, dto);
+    return this.commentModerationService.createComment(userId, dto, role);
   }
 
   @Get('comments/discussion/:discussionId')
@@ -42,9 +44,13 @@ export class DiscussionsController {
   }
 
   @Get('comments/:id')
-  @ApiOperation({ summary: 'Get a single discussion comment by ID' })
-  findComment(@Param('id') id: string) {
-    return this.commentModerationService.findCommentById(id);
+  @UseGuards(OptionalJwtAuthGuard)
+  @ApiOperation({ summary: 'Get a single discussion comment by ID (hidden/rejected comments are admin-only)' })
+  findComment(
+    @Param('id') id: string,
+    @CurrentUser('role') role?: UserRole,
+  ) {
+    return this.commentModerationService.findCommentById(id, role);
   }
 
   @Get('moderation/flagged')

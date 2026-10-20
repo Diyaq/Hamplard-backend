@@ -3,10 +3,11 @@ import {
   UseGuards, HttpCode, HttpStatus, Query,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
-import { CouponsService } from './coupons.service';
+import { CouponsService, CouponActor } from './coupons.service';
 import { CreateCouponDto } from './dto/create-coupon.dto';
 import { UpdateCouponDto } from './dto/update-coupon.dto';
 import { ValidateCouponDto } from './dto/validate-coupon.dto';
+import { RedeemCouponDto } from './dto/redeem-coupon.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../../common/guards/roles.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -27,43 +28,51 @@ export class CouponsController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.INSTRUCTOR)
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Create a new discount coupon (admin or instructor)' })
+  @ApiOperation({
+    summary: 'Create a new discount coupon (admin or instructor)',
+    description: 'Instructors must scope the coupon to a course they own; only admins can create platform-wide coupons.',
+  })
   create(
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: CouponActor,
     @Body() dto: CreateCouponDto,
   ) {
-    return this.couponsService.create(userId, dto);
+    return this.couponsService.create(user, dto);
   }
 
   @Get()
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.INSTRUCTOR)
-  @ApiOperation({ summary: 'List all coupons (admin or instructor)' })
+  @ApiOperation({ summary: 'List coupons (admins see all, instructors see their own)' })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
   @ApiQuery({ name: 'isActive', required: false, type: Boolean })
   findAll(
+    @CurrentUser() user: CouponActor,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
     @Query('isActive') isActive?: boolean,
   ) {
-    return this.couponsService.findAll(page, limit, isActive);
+    return this.couponsService.findAll(user, page, limit, isActive);
   }
 
   @Get(':id')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.INSTRUCTOR)
   @ApiOperation({ summary: 'Get a coupon by ID' })
-  findOne(@Param('id') id: string) {
-    return this.couponsService.findOne(id);
+  findOne(@Param('id') id: string, @CurrentUser() user: CouponActor) {
+    return this.couponsService.findOne(id, user);
   }
 
   @Patch(':id')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.INSTRUCTOR)
   @ApiOperation({ summary: 'Update coupon settings (discount value, expiry, limits)' })
-  update(@Param('id') id: string, @Body() dto: UpdateCouponDto) {
-    return this.couponsService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateCouponDto,
+    @CurrentUser() user: CouponActor,
+  ) {
+    return this.couponsService.update(id, dto, user);
   }
 
   @Delete(':id')
@@ -71,8 +80,8 @@ export class CouponsController {
   @Roles(UserRole.ADMIN, UserRole.INSTRUCTOR)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Deactivate a coupon (soft delete)' })
-  deactivate(@Param('id') id: string) {
-    return this.couponsService.deactivate(id);
+  deactivate(@Param('id') id: string, @CurrentUser() user: CouponActor) {
+    return this.couponsService.deactivate(id, user);
   }
 
   @Get(':id/redemptions')
@@ -83,10 +92,11 @@ export class CouponsController {
   @ApiQuery({ name: 'limit', required: false, type: Number })
   getRedemptions(
     @Param('id') id: string,
+    @CurrentUser() user: CouponActor,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
   ) {
-    return this.couponsService.getRedemptions(id, page, limit);
+    return this.couponsService.getRedemptions(id, user, page, limit);
   }
 
   // ----------------------------------------------------------
@@ -105,11 +115,11 @@ export class CouponsController {
 
   @Post('redeem')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Record a coupon redemption after a successful purchase' })
+  @ApiOperation({ summary: 'Record a coupon redemption against a verified enrollment' })
   redeem(
     @CurrentUser('id') userId: string,
-    @Body() body: { couponId: string; courseId: string; discountAmount: number },
+    @Body() dto: RedeemCouponDto,
   ) {
-    return this.couponsService.redeem(userId, body.couponId, body.courseId, body.discountAmount);
+    return this.couponsService.redeem(userId, dto);
   }
 }
